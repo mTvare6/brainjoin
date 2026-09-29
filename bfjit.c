@@ -249,6 +249,91 @@ typedef struct {
     size_t capacity;
 } Backpatches;
 
+typedef struct {
+    int32_t offset;
+    uint8_t delta;
+} Delta;
+
+typedef struct {
+    Delta *items;
+    size_t count;
+    size_t capacity;
+} Deltas;
+
+static bool linear_loop(Ops ops, size_t open, size_t *close, Deltas *deltas,
+                        uint8_t *source)
+{
+    *close = ops.items[open].operand - 1;
+    if (*close <= open || *close >= ops.count) return false;
+    int64_t head = 0;
+    for (size_t i = open + 1; i < *close; ++i) {
+        Op op = ops.items[i];
+        if (op.kind == OP_LEFT || op.kind == OP_RIGHT) {
+            head += op.kind == OP_LEFT ? -(int64_t)op.operand : (int64_t)op.operand;
+            if (head < INT32_MIN || head > INT32_MAX) goto fail;
+        } else if (op.kind == OP_INC || op.kind == OP_DEC) {
+            size_t j = 0;
+            while (j < deltas->count && deltas->items[j].offset != head) ++j;
+            if (j == deltas->count)
+                nob_da_append(deltas, ((Delta){.offset = (int32_t)head}));
+            uint8_t amount = (uint8_t)op.operand;
+            deltas->items[j].delta += op.kind == OP_INC ? amount : (uint8_t)-amount;
+        } else goto fail;
+    }
+    if (head != 0) goto fail;
+    *source = 0;
+    for (size_t i = 0; i < deltas->count; ++i)
+        if (deltas->items[i].offset == 0) *source = deltas->items[i].delta;
+    if (*source != 1 && *source != 255) goto fail;
+    return true;
+
+fail:
+    nob_da_free(*deltas);
+    memset(deltas, 0, sizeof(*deltas));
+    return false;
+}
+
+static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
+{
+    if (!offset) {
+        nob_da_append(sb, (uint8_t)(0x07 | reg << 3));
+    } else if (offset >= INT8_MIN && offset <= INT8_MAX) {
+        nob_da_append(sb, (uint8_t)(0x47 | reg << 3));
+        nob_da_append(sb, (uint8_t)offset);
+    } else {
+        nob_da_append(sb, (uint8_t)(0x87 | reg << 3));
+        nob_da_append_many(sb, &offset, sizeof(offset));
+    }
+}
+
+static void emit_zero(Nob_String_Builder *sb, int32_t offset)
+{
+    nob_da_append(sb, 0xc6);
+    emit_modrm_rdi(sb, 0, offset);
+    nob_da_append(sb, 0);
+}
+
+static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [rdi]
+    emit_modrm_rdi(sb, 0, 0);
+    for (size_t i = 0; i < deltas.count; ++i) {
+        Delta delta = deltas.items[i];
+        if (!delta.offset || !delta.delta) continue;
+        uint8_t factor = source == 255 ? delta.delta : (uint8_t)-delta.delta;
+        uint8_t reg = 0;
+        if (factor != 1 && factor != 255) {
+            nob_sb_append_cstr(sb, "\x89\xc1\x69\xc9"); // mov ecx,eax; imul ecx,factor
+            uint32_t multiplier = factor;
+            nob_da_append_many(sb, &multiplier, sizeof(multiplier));
+            reg = 1;
+        }
+        nob_da_append(sb, factor == 255 ? 0x28 : 0x00); // sub/add [target], al/cl
+        emit_modrm_rdi(sb, reg, delta.offset);
+    }
+    emit_zero(sb, 0);
+}
+
 static uintptr_t fnaddr(const void *p, size_t n)
 {
     uintptr_t result = 0;
@@ -284,6 +369,19 @@ bool jit_compile(Ops ops, Code *code)
             nob_da_append(&addrs, sb.count);
             i += 2;
             continue;
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t close;
+            uint8_t source;
+            Deltas deltas = {0};
+            if (linear_loop(ops, i, &close, &deltas, &source)) {
+                emit_linear(&sb, deltas, source);
+                nob_da_free(deltas);
+                for (size_t skipped = i + 1; skipped <= close; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = close;
+                continue;
+            }
         }
         switch (op.kind) {
             case OP_INC: {
