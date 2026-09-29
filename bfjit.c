@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include <sys/mman.h>
 
@@ -17,6 +18,9 @@ typedef enum {
     OP_INPUT           = ',',
     OP_JUMP_IF_ZERO    = '[',
     OP_JUMP_IF_NONZERO = ']',
+    OP_FORK            = '(',
+    OP_CHILD_END       = ')',
+    OP_JOIN            = '#',
 } Op_Kind;
 
 typedef struct {
@@ -37,7 +41,7 @@ typedef struct {
 
 bool is_bf_cmd(char ch)
 {
-    const char *cmds = "+-<>,.[]";
+    const char *cmds = "+-<>,.[]()#";
     return strchr(cmds, ch) != NULL;
 }
 
@@ -55,6 +59,89 @@ typedef struct {
     size_t count;
     size_t capacity;
 } Addrs;
+
+typedef struct {
+    uint32_t site;
+    bool closed;
+} Fork;
+
+typedef struct {
+    Fork *items;
+    size_t count;
+    size_t capacity;
+} Forks;
+
+typedef void (*Jit_Fn)(void *);
+
+typedef struct Child Child;
+typedef struct Join Join;
+typedef struct {
+    uint32_t stop_at;
+    Join *joins;
+} Thread;
+
+struct Child {
+    Jit_Fn run;
+    uint8_t *head;
+    Thread thread;
+    Join *join;
+};
+
+struct Join {
+    pthread_t thread;
+    pthread_barrier_t start;
+    uint32_t site;
+    Child *child;
+    Join *next;
+};
+
+static _Thread_local Thread *thread;
+
+static void join_thread(uint32_t site);
+
+static void *child_main(void *arg)
+{
+    Child *child = arg;
+    thread = &child->thread;
+    pthread_barrier_wait(&child->join->start);
+    child->run(child->head);
+    while (thread->joins) join_thread(thread->joins->site);
+    return NULL;
+}
+
+static void fork_thread(uint8_t *head, Jit_Fn run, uint32_t site)
+{
+    Child *child = calloc(1, sizeof(*child));
+    Join *join = calloc(1, sizeof(*join));
+    if (!child || !join) abort();
+    child->run = run;
+    child->head = head;
+    child->thread.stop_at = site;
+    child->join = join;
+    join->site = site;
+    join->child = child;
+    join->next = thread->joins;
+    thread->joins = join;
+    if (pthread_barrier_init(&join->start, NULL, 2) != 0) abort();
+    if (pthread_create(&join->thread, NULL, child_main, child) != 0) abort();
+    pthread_barrier_wait(&join->start);
+}
+
+static int child_ends_here(uint32_t site)
+{
+    return thread->stop_at == site;
+}
+
+static void join_thread(uint32_t site)
+{
+    Join *join = thread->joins;
+    assert(join && join->site == site);
+    if (pthread_join(join->thread, NULL) != 0) abort();
+    pthread_barrier_destroy(&join->start);
+    thread->joins = join->next;
+    free(join->child);
+    free(join);
+}
 
 bool interpret(Ops ops)
 {
@@ -125,6 +212,13 @@ bool interpret(Ops ops)
                     ip += 1;
                 }
             } break;
+
+            case OP_FORK:
+            case OP_CHILD_END:
+            case OP_JOIN: {
+                nob_log(NOB_ERROR, "fork/join requires the JIT");
+                nob_return_defer(false);
+            } break;
         }
     }
 
@@ -134,7 +228,7 @@ defer:
 }
 
 typedef struct {
-    void (*run)(void *memory);
+    Jit_Fn run;
     size_t len;
 } Code;
 
@@ -154,6 +248,21 @@ typedef struct {
     size_t count;
     size_t capacity;
 } Backpatches;
+
+static uintptr_t fnaddr(const void *p, size_t n)
+{
+    uintptr_t result = 0;
+    assert(n <= sizeof(result));
+    memcpy(&result, p, n);
+    return result;
+}
+
+static void emit_call(Nob_String_Builder *sb, uintptr_t address)
+{
+    nob_sb_append_cstr(sb, "\x48\xb8");
+    nob_da_append_many(sb, &address, sizeof(address));
+    nob_sb_append_cstr(sb, "\xff\xd0");
+}
 
 bool jit_compile(Ops ops, Code *code)
 {
@@ -249,6 +358,42 @@ bool jit_compile(Ops ops, Code *code)
                 nob_da_append(&backpatches, bp);
             } break;
 
+            case OP_FORK: {
+                nob_sb_append_cstr(&sb, "\x57");                    // save parent head
+                nob_da_append_many(&sb, "\x48\x8d\x7f\x01", 4);    // child head = parent + 1
+                nob_sb_append_cstr(&sb, "\x48\x8d\x35");            // child entry
+                size_t patch = sb.count;
+                uint32_t zero = 0;
+                nob_da_append_many(&sb, &zero, sizeof(zero));
+                size_t source = sb.count;
+                nob_sb_append_cstr(&sb, "\xba");                    // site
+                uint32_t site = op.operand;
+                nob_da_append_many(&sb, &site, sizeof(site));
+                void (*helper)(uint8_t *, Jit_Fn, uint32_t) = fork_thread;
+                emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                nob_sb_append_cstr(&sb, "\x5f");                    // restore parent head
+                int32_t relative = (int32_t)(sb.count - source);
+                memcpy(&sb.items[patch], &relative, sizeof(relative));
+            } break;
+
+            case OP_CHILD_END: {
+                nob_sb_append_cstr(&sb, "\x57\xbf");                // save head; site
+                uint32_t site = op.operand;
+                nob_da_append_many(&sb, &site, sizeof(site));
+                int (*helper)(uint32_t) = child_ends_here;
+                emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                nob_da_append_many(&sb, "\x85\xc0\x5f\x74\x01\xc3", 6);
+            } break;
+
+            case OP_JOIN: {
+                nob_sb_append_cstr(&sb, "\x57\xbf");                // save head; site
+                uint32_t site = op.operand;
+                nob_da_append_many(&sb, &site, sizeof(site));
+                void (*helper)(uint32_t) = join_thread;
+                emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                nob_sb_append_cstr(&sb, "\x5f");                    // restore head
+            } break;
+
             default: assert(0 && "Unreachable");
         }
     }
@@ -290,6 +435,8 @@ bool generate_ops(const char *file_path, Ops *ops)
     bool result = true;
     Nob_String_Builder sb = {0};
     Addrs stack = {0};
+    Forks forks = {0};
+    uint32_t next_site = 0;
 
     if (!nob_read_entire_file(file_path, &sb)) {
         nob_return_defer(false);
@@ -353,6 +500,39 @@ bool generate_ops(const char *file_path, Ops *ops)
                 c = lexer_next(&l);
             } break;
 
+            case '(': {
+                uint32_t site = next_site++;
+                nob_da_append(ops, ((Op){.kind = OP_FORK, .operand = site}));
+                nob_da_append(&forks, ((Fork){.site = site}));
+                c = lexer_next(&l);
+            } break;
+
+            case ')': {
+                if (!forks.count || forks.items[forks.count - 1].closed) {
+                    c = lexer_next(&l); // ordinary BF comment punctuation
+                    break;
+                }
+                Fork *fork = &forks.items[forks.count - 1];
+                fork->closed = true;
+                nob_da_append(ops, ((Op){.kind = OP_CHILD_END, .operand = fork->site}));
+                c = lexer_next(&l);
+            } break;
+
+            case '#': {
+                if (!forks.count) {
+                    c = lexer_next(&l); // ordinary BF comment punctuation
+                    break;
+                }
+                Fork fork = forks.items[forks.count - 1];
+                if (!fork.closed) {
+                    printf("%s [%zu]: ERROR: Join before child end\n", file_path, l.pos);
+                    nob_return_defer(false);
+                }
+                forks.count -= 1;
+                nob_da_append(ops, ((Op){.kind = OP_JOIN, .operand = fork.site}));
+                c = lexer_next(&l);
+            } break;
+
             default: {}
         }
     }
@@ -362,6 +542,12 @@ bool generate_ops(const char *file_path, Ops *ops)
         printf("%s [%zu]: ERROR: Unbalanced loop\n", file_path, l.pos);
         nob_return_defer(false);
     }
+    for (size_t i = 0; i < forks.count; ++i) {
+        if (!forks.items[i].closed) {
+            printf("%s [%zu]: ERROR: Unbalanced fork\n", file_path, l.pos);
+            nob_return_defer(false);
+        }
+    }
 
 defer:
     if (!result) {
@@ -370,6 +556,7 @@ defer:
     }
     nob_da_free(sb);
     nob_da_free(stack);
+    nob_da_free(forks);
     return result;
 }
 
@@ -424,7 +611,10 @@ int main(int argc, char **argv)
         memory = malloc(JIT_MEMORY_CAP);
         memset(memory, 0, JIT_MEMORY_CAP);
         assert(memory != NULL);
+        Thread root = {.stop_at = UINT32_MAX};
+        thread = &root;
         code.run(memory);
+        while (root.joins) join_thread(root.joins->site);
     }
 
 defer:
