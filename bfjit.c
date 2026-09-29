@@ -274,6 +274,17 @@ bool jit_compile(Ops ops, Code *code)
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
         nob_da_append(&addrs, sb.count);
+        if (op.kind == OP_JUMP_IF_ZERO && i + 2 < ops.count &&
+            (ops.items[i + 1].kind == OP_INC || ops.items[i + 1].kind == OP_DEC) &&
+            (ops.items[i + 1].operand & 1) &&
+            ops.items[i + 2].kind == OP_JUMP_IF_NONZERO &&
+            op.operand == i + 3 && ops.items[i + 2].operand == i + 1) {
+            nob_da_append_many(&sb, "\xc6\x07\x00", 3); // mov byte [rdi], 0
+            nob_da_append(&addrs, sb.count);
+            nob_da_append(&addrs, sb.count);
+            i += 2;
+            continue;
+        }
         switch (op.kind) {
             case OP_INC: {
                 assert(op.operand < 256 && "TODO: support bigger operands");
