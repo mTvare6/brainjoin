@@ -313,10 +313,11 @@ static void emit_zero(Nob_String_Builder *sb, int32_t offset)
     nob_da_append(sb, 0);
 }
 
-static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source)
+static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
+                        int32_t base)
 {
-    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [rdi]
-    emit_modrm_rdi(sb, 0, 0);
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [rdi+base]
+    emit_modrm_rdi(sb, 0, base);
     for (size_t i = 0; i < deltas.count; ++i) {
         Delta delta = deltas.items[i];
         if (!delta.offset || !delta.delta) continue;
@@ -329,9 +330,48 @@ static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source)
             reg = 1;
         }
         nob_da_append(sb, factor == 255 ? 0x28 : 0x00); // sub/add [target], al/cl
-        emit_modrm_rdi(sb, reg, delta.offset);
+        int64_t target = (int64_t)base + delta.offset;
+        assert(target >= INT32_MIN && target <= INT32_MAX);
+        emit_modrm_rdi(sb, reg, (int32_t)target);
     }
-    emit_zero(sb, 0);
+    emit_zero(sb, base);
+}
+
+static bool static_positions(Ops ops, int32_t **result)
+{
+    int32_t *positions = malloc(ops.count * sizeof(*positions));
+    int64_t *loops = NULL;
+    size_t loop_count = 0, loop_capacity = 0;
+    if (ops.count && !positions) abort();
+    int64_t head = 0;
+    for (size_t i = 0; i < ops.count; ++i) {
+        if (head < INT32_MIN || head > INT32_MAX) goto fail;
+        positions[i] = (int32_t)head;
+        Op op = ops.items[i];
+        if (op.kind == OP_LEFT) head -= op.operand;
+        else if (op.kind == OP_RIGHT) head += op.operand;
+        else if (op.kind == OP_JUMP_IF_ZERO) {
+            if (loop_count >= loop_capacity) {
+                loop_capacity = loop_capacity ? loop_capacity * 2 : 256;
+                loops = realloc(loops, loop_capacity * sizeof(*loops));
+                if (!loops) abort();
+            }
+            loops[loop_count++] = head;
+        } else if (op.kind == OP_JUMP_IF_NONZERO) {
+            if (!loop_count || loops[--loop_count] != head) goto fail;
+        } else if (op.kind == OP_FORK || op.kind == OP_CHILD_END || op.kind == OP_JOIN) {
+            goto fail;
+        }
+    }
+    if (loop_count || head < INT32_MIN || head > INT32_MAX) goto fail;
+    free(loops);
+    *result = positions;
+    return true;
+
+fail:
+    free(loops);
+    free(positions);
+    return false;
 }
 
 static uintptr_t fnaddr(const void *p, size_t n)
@@ -355,16 +395,19 @@ bool jit_compile(Ops ops, Code *code)
     Nob_String_Builder sb = {0};
     Backpatches backpatches = {0};
     Addrs addrs = {0};
+    int32_t *positions = NULL;
+    bool fixed_head = static_positions(ops, &positions);
 
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
+        int32_t base = fixed_head ? positions[i] : 0;
         nob_da_append(&addrs, sb.count);
         if (op.kind == OP_JUMP_IF_ZERO && i + 2 < ops.count &&
             (ops.items[i + 1].kind == OP_INC || ops.items[i + 1].kind == OP_DEC) &&
             (ops.items[i + 1].operand & 1) &&
             ops.items[i + 2].kind == OP_JUMP_IF_NONZERO &&
             op.operand == i + 3 && ops.items[i + 2].operand == i + 1) {
-            nob_da_append_many(&sb, "\xc6\x07\x00", 3); // mov byte [rdi], 0
+            emit_zero(&sb, base);
             nob_da_append(&addrs, sb.count);
             nob_da_append(&addrs, sb.count);
             i += 2;
@@ -375,7 +418,7 @@ bool jit_compile(Ops ops, Code *code)
             uint8_t source;
             Deltas deltas = {0};
             if (linear_loop(ops, i, &close, &deltas, &source)) {
-                emit_linear(&sb, deltas, source);
+                emit_linear(&sb, deltas, source, base);
                 nob_da_free(deltas);
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
@@ -386,34 +429,43 @@ bool jit_compile(Ops ops, Code *code)
         switch (op.kind) {
             case OP_INC: {
                 assert(op.operand < 256 && "TODO: support bigger operands");
-                nob_sb_append_cstr(&sb, "\x80\x07"); // add byte[rdi],
+                nob_da_append(&sb, 0x80); // add byte [rdi+base],
+                emit_modrm_rdi(&sb, 0, base);
                 nob_da_append(&sb, op.operand&0xFF);
             } break;
 
             case OP_DEC: {
                 assert(op.operand < 256 && "TODO: support bigger operands");
-                nob_sb_append_cstr(&sb, "\x80\x2f"); // sub byte[rdi],
+                nob_da_append(&sb, 0x80); // sub byte [rdi+base],
+                emit_modrm_rdi(&sb, 5, base);
                 nob_da_append(&sb, op.operand&0xFF);
             } break;
 
             // TODO: range checks for OP_LEFT and OP_RIGHT
             case OP_LEFT: {
-                nob_sb_append_cstr(&sb, "\x48\x81\xef"); // sub rdi,
-                uint32_t operand = (uint32_t)op.operand;
-                nob_da_append_many(&sb, &operand, sizeof(operand));
+                if (!fixed_head) {
+                    nob_sb_append_cstr(&sb, "\x48\x81\xef"); // sub rdi,
+                    uint32_t operand = (uint32_t)op.operand;
+                    nob_da_append_many(&sb, &operand, sizeof(operand));
+                }
             } break;
 
             case OP_RIGHT: {
-                nob_sb_append_cstr(&sb, "\x48\x81\xc7"); // add rdi,
-                uint32_t operand = (uint32_t)op.operand;
-                nob_da_append_many(&sb, &operand, sizeof(operand));
+                if (!fixed_head) {
+                    nob_sb_append_cstr(&sb, "\x48\x81\xc7"); // add rdi,
+                    uint32_t operand = (uint32_t)op.operand;
+                    nob_da_append_many(&sb, &operand, sizeof(operand));
+                }
             } break;
 
             case OP_OUTPUT: {
                 for (size_t i = 0; i < op.operand; ++i) {
                     nob_sb_append_cstr(&sb, "\x57");                            // push rdi
                     nob_da_append_many(&sb, "\x48\xc7\xc0\x01\x00\x00\x00", 7); // mov rax, 1
-                    nob_sb_append_cstr(&sb, "\x48\x89\xfe");                    // mov rsi, rdi
+                    if (fixed_head) {
+                        nob_sb_append_cstr(&sb, "\x48\x8d\xb7");                // lea rsi, [rdi+base]
+                        nob_da_append_many(&sb, &base, sizeof(base));
+                    } else nob_sb_append_cstr(&sb, "\x48\x89\xfe");            // mov rsi, rdi
                     nob_da_append_many(&sb, "\x48\xc7\xc7\x01\x00\x00\x00", 7); // mov rdi, 1
                     nob_da_append_many(&sb, "\x48\xc7\xc2\x01\x00\x00\x00", 7); // mov rdx, 1
                     nob_sb_append_cstr(&sb, "\x0f\x05");                        // syscall
@@ -425,7 +477,10 @@ bool jit_compile(Ops ops, Code *code)
                 for (size_t i = 0; i < op.operand; ++i) {
                     nob_sb_append_cstr(&sb, "\x57");                            // push rdi
                     nob_da_append_many(&sb, "\x48\xc7\xc0\x00\x00\x00\x00", 7); // mov rax, 0
-                    nob_sb_append_cstr(&sb, "\x48\x89\xfe");                    // mov rsi, rdi
+                    if (fixed_head) {
+                        nob_sb_append_cstr(&sb, "\x48\x8d\xb7");                // lea rsi, [rdi+base]
+                        nob_da_append_many(&sb, &base, sizeof(base));
+                    } else nob_sb_append_cstr(&sb, "\x48\x89\xfe");            // mov rsi, rdi
                     nob_da_append_many(&sb, "\x48\xc7\xc7\x00\x00\x00\x00", 7); // mov rdi, 0
                     nob_da_append_many(&sb, "\x48\xc7\xc2\x01\x00\x00\x00", 7); // mov rdx, 1
                     nob_sb_append_cstr(&sb, "\x0f\x05");                        // syscall
@@ -434,8 +489,9 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_JUMP_IF_ZERO: {
-                nob_sb_append_cstr(&sb, "\x8a\x07");     // mov al, byte [rdi]
-                nob_sb_append_cstr(&sb, "\x84\xc0");     // test al, al
+                nob_da_append(&sb, 0x80);                  // cmp byte [rdi+base], 0
+                emit_modrm_rdi(&sb, 7, base);
+                nob_da_append(&sb, 0);
                 nob_sb_append_cstr(&sb, "\x0f\x84");     // jz
                 size_t operand_byte_addr = sb.count;
                 nob_da_append_many(&sb, "\x00\x00\x00\x00", 4);
@@ -451,8 +507,9 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_JUMP_IF_NONZERO: {
-                nob_sb_append_cstr(&sb, "\x8a\x07");     // mov al, byte [rdi]
-                nob_sb_append_cstr(&sb, "\x84\xc0");     // test al, al
+                nob_da_append(&sb, 0x80);                  // cmp byte [rdi+base], 0
+                emit_modrm_rdi(&sb, 7, base);
+                nob_da_append(&sb, 0);
                 nob_sb_append_cstr(&sb, "\x0f\x85");     // jnz
                 size_t operand_byte_addr = sb.count;
                 nob_da_append_many(&sb, "\x00\x00\x00\x00", 4);
@@ -536,6 +593,7 @@ defer:
     nob_da_free(sb);
     nob_da_free(backpatches);
     nob_da_free(addrs);
+    free(positions);
     return result;
 }
 
