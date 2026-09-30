@@ -274,6 +274,24 @@ typedef struct {
     int32_t offsets[];
 } Affine;
 
+typedef struct {
+    int32_t low, scratch, flag, high;
+} Carry;
+
+static int64_t add_amount(Op op)
+{
+    if (op.kind == OP_INC) return (int64_t)op.operand;
+    if (op.kind == OP_DEC) return -(int64_t)op.operand;
+    return INT64_MIN;
+}
+
+static int64_t move_amount(Op op)
+{
+    if (op.kind == OP_RIGHT) return (int64_t)op.operand;
+    if (op.kind == OP_LEFT) return -(int64_t)op.operand;
+    return INT64_MIN;
+}
+
 static bool linear_loop(Ops ops, size_t open, size_t *close, Deltas *deltas,
                         uint8_t *source)
 {
@@ -495,6 +513,51 @@ fail:
     return false;
 }
 
+static bool carry_loop(Ops ops, size_t open, size_t *close, Carry *result)
+{
+    *close = ops.items[open].operand - 1;
+    if (*close != open + 39 || *close >= ops.count) return false;
+    const Op *x = ops.items + open;
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == open + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == open + (target))
+    int64_t to_low = move_amount(x[2]);
+    int64_t low_to_scratch = move_amount(x[4]);
+    int64_t flag_to_high = move_amount(x[34]);
+    bool shape =
+        A(1,-1) && to_low < 0 && A(3,1) && low_to_scratch > 0 &&
+        B(5,8) && A(6,-1) && E(7,6) && M(8,1) &&
+        B(9,12) && A(10,-1) && E(11,10) && A(12,1) &&
+        M(13,-(low_to_scratch+1)) &&
+        B(14,24) && A(15,-1) && M(16,low_to_scratch) &&
+        A(17,1) && M(18,1) && B(19,22) && A(20,-1) && E(21,20) &&
+        M(22,-(low_to_scratch+1)) && E(23,15) && M(24,low_to_scratch) &&
+        B(25,31) && A(26,-1) && M(27,-low_to_scratch) &&
+        A(28,1) && M(29,low_to_scratch) && E(30,26) && M(31,1) &&
+        B(32,38) && A(33,-1) && flag_to_high > 0 && A(35,1) &&
+        M(36,-flag_to_high) && E(37,33) && E(39,1);
+    int64_t low = to_low;
+    int64_t scratch = low + low_to_scratch;
+    int64_t flag = scratch + 1;
+    int64_t high = flag + flag_to_high;
+    shape = shape && M(38,-flag);
+#undef A
+#undef M
+#undef B
+#undef E
+    if (!shape || low < INT32_MIN || low > INT32_MAX ||
+        scratch < INT32_MIN || scratch > INT32_MAX ||
+        flag < INT32_MIN || flag > INT32_MAX ||
+        high < INT32_MIN || high > INT32_MAX ||
+        !low || !scratch || !flag || !high ||
+        low == scratch || low == flag || low == high ||
+        scratch == flag || scratch == high || flag == high) return false;
+    *result = (Carry){(int32_t)low, (int32_t)scratch,
+                      (int32_t)flag, (int32_t)high};
+    return true;
+}
+
 static void affine_exec(uint8_t *base, const Affine *affine)
 {
     size_t count = affine->count, width = count + 1, cells = width * width;
@@ -540,6 +603,34 @@ static void emit_add_byte(Nob_String_Builder *sb, bool subtract,
 {
     nob_da_append(sb, subtract ? 0x28 : 0x00);
     emit_modrm_rdi(sb, reg, offset);
+}
+
+static void emit_store_byte(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
+{
+    nob_da_append(sb, 0x88);
+    emit_modrm_rdi(sb, reg, offset);
+}
+
+static void emit_carry(Nob_String_Builder *sb, Carry carry, int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2);
+    emit_modrm_rdi(sb, 0, base);
+    nob_da_append_many(sb, "\x85\xc0\x74", 3);
+    size_t patch = sb->count;
+    nob_da_append(sb, 0);
+    size_t source = sb->count;
+    nob_da_append_many(sb, "\x0f\xb6", 2);
+    emit_modrm_rdi(sb, 1, base + carry.low);
+    nob_sb_append_cstr(sb, "\x01\xc1");
+    emit_store_byte(sb, 1, base + carry.low);
+    nob_da_append_many(sb, "\xc1\xe9\x08", 3);
+    emit_add_byte(sb, false, base + carry.high, 1);
+    emit_zero(sb, base + carry.scratch);
+    emit_zero(sb, base + carry.flag);
+    emit_zero(sb, base);
+    size_t distance = sb->count - source;
+    assert(distance <= INT8_MAX);
+    sb->items[patch] = (uint8_t)distance;
 }
 
 static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
@@ -720,6 +811,17 @@ bool jit_compile(Ops ops, Code *code)
             if (linear_loop(ops, i, &close, &deltas, &source)) {
                 emit_linear(&sb, deltas, source, base);
                 nob_da_free(deltas);
+                for (size_t skipped = i + 1; skipped <= close; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = close;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t close;
+            Carry carry;
+            if (carry_loop(ops, i, &close, &carry)) {
+                emit_carry(&sb, carry, base);
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = close;
