@@ -260,6 +260,20 @@ typedef struct {
     size_t capacity;
 } Deltas;
 
+enum { AFFINE_DOWN = 1, AFFINE_UP, AFFINE_IF };
+
+typedef struct Affine_Plan {
+    struct Affine_Plan *next;
+    uint32_t count, kind;
+    uint8_t tables[];
+} Affine_Plan;
+
+typedef struct {
+    uint32_t count, kind, control;
+    const Affine_Plan *plan;
+    int32_t offsets[];
+} Affine;
+
 static bool linear_loop(Ops ops, size_t open, size_t *close, Deltas *deltas,
                         uint8_t *source)
 {
@@ -293,6 +307,214 @@ fail:
     return false;
 }
 
+static int compare_i32(const void *a, const void *b)
+{
+    int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+    return (x > y) - (x < y);
+}
+
+static bool add_offset(int32_t **items, size_t *count, size_t *capacity,
+                       int64_t value)
+{
+    if (value < INT32_MIN || value > INT32_MAX) return false;
+    int32_t offset = (int32_t)value;
+    for (size_t i = 0; i < *count; ++i)
+        if ((*items)[i] == offset) return true;
+    if (*count >= *capacity) {
+        *capacity = *capacity ? *capacity * 2 : 16;
+        *items = realloc(*items, *capacity * sizeof(**items));
+        if (!*items) abort();
+    }
+    (*items)[(*count)++] = offset;
+    return true;
+}
+
+static size_t offset_index(const int32_t *offsets, size_t count, int32_t value)
+{
+    size_t low = 0, high = count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (offsets[middle] < value) low = middle + 1;
+        else high = middle;
+    }
+    return low < count && offsets[low] == value ? low : SIZE_MAX;
+}
+
+static uint8_t op_delta(Op op)
+{
+    uint8_t amount = (uint8_t)op.operand;
+    return op.kind == OP_INC ? amount : (uint8_t)-amount;
+}
+
+static void matrix_multiply(uint8_t *out, const uint8_t *left,
+                            const uint8_t *right, size_t width)
+{
+    for (size_t row = 0; row < width; ++row) {
+        for (size_t column = 0; column < width; ++column) {
+            uint32_t sum = 0;
+            for (size_t k = 0; k < width; ++k)
+                sum += (uint32_t)left[row * width + k] * right[k * width + column];
+            out[row * width + column] = (uint8_t)sum;
+        }
+    }
+}
+
+static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
+                                  uint32_t kind, const uint8_t *matrix)
+{
+    size_t width = (size_t)count + 1, cells = width * width;
+    for (Affine_Plan *plan = *plans; plan; plan = plan->next) {
+        if (plan->count != count || plan->kind != kind) continue;
+        const uint8_t *body = plan->tables + (kind == AFFINE_IF ? 0 : cells);
+        if (!memcmp(body, matrix, cells)) return plan;
+    }
+    size_t table_count = kind == AFFINE_IF ? 1 : 256;
+    Affine_Plan *plan = malloc(sizeof(*plan) + table_count * cells);
+    if (!plan) abort();
+    plan->next = *plans;
+    plan->count = count;
+    plan->kind = kind;
+    if (kind == AFFINE_IF) {
+        memcpy(plan->tables, matrix, cells);
+    } else {
+        memset(plan->tables, 0, cells);
+        for (size_t i = 0; i < width; ++i) plan->tables[i * width + i] = 1;
+        memcpy(plan->tables + cells, matrix, cells);
+        for (size_t i = 2; i < 256; ++i)
+            matrix_multiply(plan->tables + i * cells, matrix,
+                            plan->tables + (i - 1) * cells, width);
+    }
+    *plans = plan;
+    return plan;
+}
+
+static bool affine_loop(Ops ops, size_t open, size_t *close, Affine **result,
+                        Affine_Plan **plans)
+{
+    *close = ops.items[open].operand - 1;
+    if (*close <= open || *close >= ops.count) return false;
+    int64_t head = 0;
+    int32_t *offsets = NULL;
+    size_t count = 0, capacity = 0;
+    if (!add_offset(&offsets, &count, &capacity, 0)) goto fail;
+
+    for (size_t i = open + 1; i < *close; ++i) {
+        Op op = ops.items[i];
+        if (op.kind == OP_LEFT || op.kind == OP_RIGHT) {
+            head += op.kind == OP_LEFT ? -(int64_t)op.operand : (int64_t)op.operand;
+            if (head < INT32_MIN || head > INT32_MAX) goto fail;
+        } else if (op.kind == OP_INC || op.kind == OP_DEC) {
+            if (!add_offset(&offsets, &count, &capacity, head)) goto fail;
+        } else if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t nested_close;
+            uint8_t source;
+            Deltas nested = {0};
+            if (!linear_loop(ops, i, &nested_close, &nested, &source)) goto fail;
+            for (size_t j = 0; j < nested.count; ++j) {
+                if (!add_offset(&offsets, &count, &capacity,
+                                head + nested.items[j].offset)) {
+                    nob_da_free(nested);
+                    goto fail;
+                }
+            }
+            nob_da_free(nested);
+            i = nested_close;
+        } else goto fail;
+    }
+    if (head || count > 32) goto fail;
+
+    qsort(offsets, count, sizeof(*offsets), compare_i32);
+    size_t width = count + 1, cells = width * width;
+    uint8_t *matrix = calloc(cells, 1);
+    if (!matrix) abort();
+    for (size_t i = 0; i < width; ++i) matrix[i * width + i] = 1;
+    head = 0;
+    for (size_t i = open + 1; i < *close; ++i) {
+        Op op = ops.items[i];
+        if (op.kind == OP_LEFT || op.kind == OP_RIGHT) {
+            head += op.kind == OP_LEFT ? -(int64_t)op.operand : (int64_t)op.operand;
+        } else if (op.kind == OP_INC || op.kind == OP_DEC) {
+            size_t row = offset_index(offsets, count, (int32_t)head);
+            matrix[row * width + count] += op_delta(op);
+        } else {
+            size_t nested_close;
+            uint8_t source;
+            Deltas nested = {0};
+            if (!linear_loop(ops, i, &nested_close, &nested, &source)) abort();
+            size_t source_row = offset_index(offsets, count, (int32_t)head);
+            uint8_t saved[33];
+            memcpy(saved, matrix + source_row * width, width);
+            for (size_t j = 0; j < nested.count; ++j) {
+                Delta delta = nested.items[j];
+                if (!delta.offset || !delta.delta) continue;
+                size_t row = offset_index(offsets, count,
+                                          (int32_t)(head + delta.offset));
+                uint8_t factor = source == 255 ? delta.delta : (uint8_t)-delta.delta;
+                for (size_t column = 0; column < width; ++column)
+                    matrix[row * width + column] += factor * saved[column];
+            }
+            memset(matrix + source_row * width, 0, width);
+            nob_da_free(nested);
+            i = nested_close;
+        }
+    }
+
+    size_t control = offset_index(offsets, count, 0);
+    uint32_t kind = 0;
+    bool identity = matrix[control * width + control] == 1;
+    for (size_t column = 0; column < count; ++column)
+        if (column != control && matrix[control * width + column]) identity = false;
+    uint8_t constant = matrix[control * width + count];
+    if (identity && constant == 255) kind = AFFINE_DOWN;
+    else if (identity && constant == 1) kind = AFFINE_UP;
+    else {
+        bool zero = true;
+        for (size_t column = 0; column < width; ++column)
+            if (matrix[control * width + column]) zero = false;
+        if (zero) kind = AFFINE_IF;
+    }
+    if (!kind) {
+        free(matrix);
+        goto fail;
+    }
+
+    Affine *affine = malloc(sizeof(*affine) + count * sizeof(*affine->offsets));
+    if (!affine) abort();
+    affine->count = (uint32_t)count;
+    affine->kind = kind;
+    affine->control = (uint32_t)control;
+    affine->plan = intern_affine(plans, (uint32_t)count, kind, matrix);
+    memcpy(affine->offsets, offsets, count * sizeof(*offsets));
+    free(matrix);
+    free(offsets);
+    *result = affine;
+    return true;
+
+fail:
+    free(offsets);
+    return false;
+}
+
+static void affine_exec(uint8_t *base, const Affine *affine)
+{
+    size_t count = affine->count, width = count + 1, cells = width * width;
+    uint8_t state[33], next[33];
+    for (size_t i = 0; i < count; ++i) state[i] = base[affine->offsets[i]];
+    state[count] = 1;
+    uint8_t iterations = state[affine->control];
+    if (!iterations) return;
+    if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
+    const uint8_t *matrix = affine->plan->tables +
+        (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
+    for (size_t row = 0; row < count; ++row) {
+        uint32_t sum = 0;
+        for (size_t column = 0; column < width; ++column)
+            sum += (uint32_t)matrix[row * width + column] * state[column];
+        next[row] = (uint8_t)sum;
+    }
+    for (size_t i = 0; i < count; ++i) base[affine->offsets[i]] = next[i];
+}
+
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
 {
     if (!offset) {
@@ -311,6 +533,13 @@ static void emit_zero(Nob_String_Builder *sb, int32_t offset)
     nob_da_append(sb, 0xc6);
     emit_modrm_rdi(sb, 0, offset);
     nob_da_append(sb, 0);
+}
+
+static void emit_add_byte(Nob_String_Builder *sb, bool subtract,
+                          int32_t offset, uint8_t reg)
+{
+    nob_da_append(sb, subtract ? 0x28 : 0x00);
+    emit_modrm_rdi(sb, reg, offset);
 }
 
 static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
@@ -335,6 +564,60 @@ static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
         emit_modrm_rdi(sb, reg, (int32_t)target);
     }
     emit_zero(sb, base);
+}
+
+static bool emit_simple_affine(Nob_String_Builder *sb, const Affine *affine,
+                               int32_t base)
+{
+    if (affine->kind != AFFINE_DOWN && affine->kind != AFFINE_UP) return false;
+    size_t count = affine->count, width = count + 1, cells = width * width;
+    const uint8_t *matrix = affine->plan->tables + cells;
+    size_t control = affine->control;
+    for (size_t row = 0; row < count; ++row) {
+        if (row == control) continue;
+        for (size_t column = 0; column < count; ++column) {
+            uint8_t expected = column == row ? matrix[row * width + row] : 0;
+            if (matrix[row * width + column] != expected) return false;
+        }
+        if (matrix[row * width + row] > 1) return false;
+    }
+
+    int64_t control_offset = (int64_t)base + affine->offsets[control];
+    if (control_offset < INT32_MIN || control_offset > INT32_MAX) return false;
+    nob_da_append_many(sb, "\x0f\xb6", 2);
+    emit_modrm_rdi(sb, 0, (int32_t)control_offset);
+    nob_da_append_many(sb, "\x85\xc0\x0f\x84", 4);
+    size_t patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t source = sb->count;
+    if (affine->kind == AFFINE_UP) nob_sb_append_cstr(sb, "\xf7\xd8");
+
+    for (size_t row = 0; row < count; ++row) {
+        if (row == control) continue;
+        int64_t target = (int64_t)base + affine->offsets[row];
+        if (target < INT32_MIN || target > INT32_MAX) return false;
+        uint8_t self = matrix[row * width + row];
+        uint8_t constant = matrix[row * width + count];
+        if (!self) {
+            nob_da_append(sb, 0xc6);
+            emit_modrm_rdi(sb, 0, (int32_t)target);
+            nob_da_append(sb, constant);
+        } else if (constant == 1) {
+            emit_add_byte(sb, false, (int32_t)target, 0);
+        } else if (constant == 255) {
+            emit_add_byte(sb, true, (int32_t)target, 0);
+        } else if (constant) {
+            nob_sb_append_cstr(sb, "\x89\xc1\x69\xc9");
+            uint32_t multiplier = constant;
+            nob_da_append_many(sb, &multiplier, sizeof(multiplier));
+            emit_add_byte(sb, false, (int32_t)target, 1);
+        }
+    }
+    emit_zero(sb, (int32_t)control_offset);
+    int32_t relative = (int32_t)(sb->count - source);
+    memcpy(&sb->items[patch], &relative, sizeof(relative));
+    return true;
 }
 
 static bool static_positions(Ops ops, int32_t **result)
@@ -389,6 +672,22 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
     nob_sb_append_cstr(sb, "\xff\xd0");
 }
 
+static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
+                             int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    if (base) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
+        nob_da_append_many(sb, &base, sizeof(base));
+    }
+    nob_sb_append_cstr(sb, "\x48\xbe"); // movabs rsi, affine
+    uintptr_t descriptor = (uintptr_t)affine;
+    nob_da_append_many(sb, &descriptor, sizeof(descriptor));
+    void (*helper)(uint8_t *, const Affine *) = affine_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 bool jit_compile(Ops ops, Code *code)
 {
     bool result = true;
@@ -397,6 +696,7 @@ bool jit_compile(Ops ops, Code *code)
     Addrs addrs = {0};
     int32_t *positions = NULL;
     bool fixed_head = static_positions(ops, &positions);
+    Affine_Plan *plans = NULL;
 
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
@@ -420,6 +720,18 @@ bool jit_compile(Ops ops, Code *code)
             if (linear_loop(ops, i, &close, &deltas, &source)) {
                 emit_linear(&sb, deltas, source, base);
                 nob_da_free(deltas);
+                for (size_t skipped = i + 1; skipped <= close; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = close;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t close;
+            Affine *affine = NULL;
+            if (affine_loop(ops, i, &close, &affine, &plans)) {
+                if (emit_simple_affine(&sb, affine, base)) free(affine);
+                else emit_affine_call(&sb, affine, base);
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = close;
