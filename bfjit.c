@@ -44,8 +44,11 @@ typedef struct {
 
 bool is_bf_cmd(char ch)
 {
-    const char *cmds = "+-<>,.[]()#";
-    return strchr(cmds, ch) != NULL;
+    switch (ch) {
+        case '+': case '-': case '<': case '>': case ',': case '.':
+        case '[': case ']': case '(': case ')': case '#': return true;
+        default: return false;
+    }
 }
 
 char lexer_next(Lexer *l)
