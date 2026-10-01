@@ -884,6 +884,7 @@ bool jit_compile(Ops ops, Code *code)
             if (copy_block(ops, i, &end, &copy) || move_block(ops, i, &end, &copy)) {
                 emit_copy(&sb, copy, base);
                 if (!fixed_head) emit_head_adjust(&sb, copy.final_head);
+                if (clear_at(ops, end + 1)) end += 3;
                 for (size_t skipped = i + 1; skipped <= end; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = end;
@@ -919,6 +920,7 @@ bool jit_compile(Ops ops, Code *code)
             if (linear_loop(ops, i, &close, &deltas, &source)) {
                 emit_linear(&sb, deltas, source, base);
                 nob_da_free(deltas);
+                if (clear_at(ops, close + 1)) close += 3;
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = close;
@@ -930,6 +932,7 @@ bool jit_compile(Ops ops, Code *code)
             Carry carry;
             if (carry_loop(ops, i, &close, &carry)) {
                 emit_carry(&sb, carry, base);
+                if (clear_at(ops, close + 1)) close += 3;
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = close;
@@ -942,6 +945,7 @@ bool jit_compile(Ops ops, Code *code)
             if (affine_loop(ops, i, &close, &affine, &plans)) {
                 if (emit_simple_affine(&sb, affine, base)) free(affine);
                 else emit_affine_call(&sb, affine, base);
+                if (clear_at(ops, close + 1)) close += 3;
                 for (size_t skipped = i + 1; skipped <= close; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = close;
