@@ -278,6 +278,11 @@ typedef struct {
     int32_t low, scratch, flag, high;
 } Carry;
 
+typedef struct {
+    int32_t source, temporary, final_head;
+    bool destructive;
+} Copy;
+
 static int64_t add_amount(Op op)
 {
     if (op.kind == OP_INC) return (int64_t)op.operand;
@@ -290,6 +295,65 @@ static int64_t move_amount(Op op)
     if (op.kind == OP_RIGHT) return (int64_t)op.operand;
     if (op.kind == OP_LEFT) return -(int64_t)op.operand;
     return INT64_MIN;
+}
+
+static bool clear_at(Ops ops, size_t at)
+{
+    return at + 2 < ops.count && ops.items[at].kind == OP_JUMP_IF_ZERO &&
+        ops.items[at].operand == at + 3 && add_amount(ops.items[at + 1]) == -1 &&
+        ops.items[at + 2].kind == OP_JUMP_IF_NONZERO &&
+        ops.items[at + 2].operand == at + 1;
+}
+
+static bool copy_block(Ops ops, size_t at, size_t *end, Copy *result)
+{
+    if (at + 22 >= ops.count || !clear_at(ops, at) ||
+        move_amount(ops.items[at + 3]) == INT64_MIN || !clear_at(ops, at + 4) ||
+        move_amount(ops.items[at + 7]) == INT64_MIN) return false;
+    const Op *x = ops.items + at;
+    int64_t temporary = move_amount(x[3]);
+    int64_t source = temporary + move_amount(x[7]);
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == at + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == at + (target))
+    bool shape = B(8,16) && A(9,-1) && M(10,-source) && A(11,1) &&
+        M(12,temporary) && A(13,1) && M(14,source-temporary) && E(15,9) &&
+        M(16,temporary-source) && B(17,23) && A(18,-1) &&
+        M(19,source-temporary) && A(20,1) && M(21,temporary-source) && E(22,18);
+#undef A
+#undef M
+#undef B
+#undef E
+    if (!shape || !source || !temporary || source == temporary ||
+        source < INT32_MIN || source > INT32_MAX ||
+        temporary < INT32_MIN || temporary > INT32_MAX) return false;
+    *result = (Copy){(int32_t)source, (int32_t)temporary,
+                     (int32_t)temporary, false};
+    *end = at + 22;
+    return true;
+}
+
+static bool move_block(Ops ops, size_t at, size_t *end, Copy *result)
+{
+    if (at + 9 >= ops.count || !clear_at(ops, at) ||
+        move_amount(ops.items[at + 3]) == INT64_MIN) return false;
+    const Op *x = ops.items + at;
+    int64_t source = move_amount(x[3]);
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == at + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == at + (target))
+    bool shape = B(4,10) && A(5,-1) && M(6,-source) && A(7,1) &&
+        M(8,source) && E(9,5);
+#undef A
+#undef M
+#undef B
+#undef E
+    if (!shape || !source || source < INT32_MIN || source > INT32_MAX) return false;
+    *result = (Copy){(int32_t)source, 0, (int32_t)source, true};
+    *end = at + 9;
+    return true;
 }
 
 static bool linear_loop(Ops ops, size_t open, size_t *close, Deltas *deltas,
@@ -611,6 +675,27 @@ static void emit_store_byte(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
     emit_modrm_rdi(sb, reg, offset);
 }
 
+static void emit_head_adjust(Nob_String_Builder *sb, int32_t amount)
+{
+    if (!amount) return;
+    if (amount >= INT8_MIN && amount <= INT8_MAX) {
+        nob_da_append_many(sb, "\x48\x83\xc7", 3);
+        nob_da_append(sb, (uint8_t)amount);
+    } else {
+        nob_da_append_many(sb, amount > 0 ? "\x48\x81\xc7" : "\x48\x81\xef", 3);
+        uint32_t distance = amount > 0 ? (uint32_t)amount : (uint32_t)-amount;
+        nob_da_append_many(sb, &distance, sizeof(distance));
+    }
+}
+
+static void emit_copy(Nob_String_Builder *sb, Copy copy, int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2);
+    emit_modrm_rdi(sb, 0, base + copy.source);
+    emit_store_byte(sb, 0, base);
+    emit_zero(sb, base + (copy.destructive ? copy.source : copy.temporary));
+}
+
 static void emit_carry(Nob_String_Builder *sb, Carry carry, int32_t base)
 {
     nob_da_append_many(sb, "\x0f\xb6", 2);
@@ -793,6 +878,29 @@ bool jit_compile(Ops ops, Code *code)
         Op op = ops.items[i];
         int32_t base = fixed_head ? positions[i] : 0;
         nob_da_append(&addrs, sb.count);
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t end;
+            Copy copy;
+            if (copy_block(ops, i, &end, &copy) || move_block(ops, i, &end, &copy)) {
+                emit_copy(&sb, copy, base);
+                if (!fixed_head) emit_head_adjust(&sb, copy.final_head);
+                for (size_t skipped = i + 1; skipped <= end; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = end;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO && clear_at(ops, i) &&
+            i + 3 < ops.count &&
+            (ops.items[i + 3].kind == OP_INC || ops.items[i + 3].kind == OP_DEC)) {
+            nob_da_append(&sb, 0xc6);
+            emit_modrm_rdi(&sb, 0, base);
+            nob_da_append(&sb, (uint8_t)add_amount(ops.items[i + 3]));
+            for (size_t skipped = i + 1; skipped <= i + 3; ++skipped)
+                nob_da_append(&addrs, sb.count);
+            i += 3;
+            continue;
+        }
         if (op.kind == OP_JUMP_IF_ZERO && i + 2 < ops.count &&
             (ops.items[i + 1].kind == OP_INC || ops.items[i + 1].kind == OP_DEC) &&
             (ops.items[i + 1].operand & 1) &&
