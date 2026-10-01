@@ -1291,12 +1291,11 @@ bool generate_ops(const char *file_path, Ops *ops)
             case '>':
             case '-':
             case '+': {
-                size_t count = 1;
+                size_t start = l.pos;
+                while (l.pos < l.content.count && l.content.data[l.pos] == c)
+                    l.pos += 1;
+                size_t count = l.pos - start + 1;
                 char s = lexer_next(&l);
-                while (s == c) {
-                    count += 1;
-                    s = lexer_next(&l);
-                }
                 if (count > INT32_MAX) {
                     printf("%s [%zu]: ERROR: Command run is too long\n", file_path, l.pos);
                     nob_return_defer(false);
