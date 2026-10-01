@@ -283,6 +283,10 @@ typedef struct {
     bool destructive;
 } Copy;
 
+typedef struct {
+    int32_t scratch, flag, carry;
+} Increment_Carry;
+
 static int64_t add_amount(Op op)
 {
     if (op.kind == OP_INC) return (int64_t)op.operand;
@@ -353,6 +357,38 @@ static bool move_block(Ops ops, size_t at, size_t *end, Copy *result)
     if (!shape || !source || source < INT32_MIN || source > INT32_MAX) return false;
     *result = (Copy){(int32_t)source, 0, (int32_t)source, true};
     *end = at + 9;
+    return true;
+}
+
+static bool increment_carry(Ops ops, size_t at, size_t *end,
+                            Increment_Carry *result)
+{
+    if (at + 34 >= ops.count) return false;
+    const Op *x = ops.items + at;
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == at + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == at + (target))
+    int64_t to_scratch = move_amount(x[1]);
+    int64_t flag_to_carry = move_amount(x[31]);
+    bool shape = A(0,1) && to_scratch > 0 && B(2,5) && A(3,-1) && E(4,3) &&
+        M(5,1) && B(6,9) && A(7,-1) && E(8,7) && A(9,1) &&
+        M(10,-(to_scratch+1)) && B(11,21) && A(12,-1) &&
+        M(13,to_scratch) && A(14,1) && M(15,1) &&
+        B(16,19) && A(17,-1) && E(18,17) &&
+        M(19,-(to_scratch+1)) && E(20,12) && M(21,to_scratch) &&
+        B(22,28) && A(23,-1) && M(24,-to_scratch) &&
+        A(25,1) && M(26,to_scratch) && E(27,23) && M(28,1) &&
+        B(29,35) && A(30,-1) && flag_to_carry > 0 && A(32,1) &&
+        M(33,-flag_to_carry) && E(34,30);
+#undef A
+#undef M
+#undef B
+#undef E
+    int64_t scratch = to_scratch, flag = scratch + 1, carry = flag + flag_to_carry;
+    if (!shape || carry > INT32_MAX || scratch == carry || flag == carry) return false;
+    *result = (Increment_Carry){(int32_t)scratch, (int32_t)flag, (int32_t)carry};
+    *end = at + 34;
     return true;
 }
 
@@ -718,6 +754,24 @@ static void emit_carry(Nob_String_Builder *sb, Carry carry, int32_t base)
     sb->items[patch] = (uint8_t)distance;
 }
 
+static void emit_increment_carry(Nob_String_Builder *sb,
+                                 Increment_Carry increment, int32_t base)
+{
+    nob_da_append(sb, 0x80);
+    emit_modrm_rdi(sb, 0, base);
+    nob_da_append(sb, 1);
+    nob_da_append_many(sb, "\x75\x00", 2);
+    size_t patch = sb->count - 1, source = sb->count;
+    nob_da_append(sb, 0x80);
+    emit_modrm_rdi(sb, 0, base + increment.carry);
+    nob_da_append(sb, 1);
+    size_t distance = sb->count - source;
+    assert(distance <= INT8_MAX);
+    sb->items[patch] = (uint8_t)distance;
+    emit_zero(sb, base + increment.scratch);
+    emit_zero(sb, base + increment.flag);
+}
+
 static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
                         int32_t base)
 {
@@ -878,6 +932,19 @@ bool jit_compile(Ops ops, Code *code)
         Op op = ops.items[i];
         int32_t base = fixed_head ? positions[i] : 0;
         nob_da_append(&addrs, sb.count);
+        {
+            size_t end;
+            Increment_Carry increment;
+            if (increment_carry(ops, i, &end, &increment)) {
+                emit_increment_carry(&sb, increment, base);
+                if (!fixed_head) emit_head_adjust(&sb, increment.flag);
+                if (clear_at(ops, end + 1)) end += 3;
+                for (size_t skipped = i + 1; skipped <= end; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = end;
+                continue;
+            }
+        }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
             Copy copy;
