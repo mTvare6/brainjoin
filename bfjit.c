@@ -245,15 +245,14 @@ void free_code(Code code)
 
 typedef struct {
     size_t operand_byte_addr;
-    size_t src_byte_addr;
-    size_t dst_op_index;
-} Backpatch;
+    size_t body_byte_addr;
+} Loop_Patch;
 
 typedef struct {
-    Backpatch *items;
+    Loop_Patch *items;
     size_t count;
     size_t capacity;
-} Backpatches;
+} Loop_Patches;
 
 typedef struct {
     int32_t offset;
@@ -995,8 +994,7 @@ bool jit_compile(Ops ops, Code *code)
 {
     bool result = true;
     Nob_String_Builder sb = {0};
-    Backpatches backpatches = {0};
-    Addrs addrs = {0};
+    Loop_Patches loops = {0};
     int32_t *positions = NULL;
     bool fixed_head = static_positions(ops, &positions);
     Affine_Plan *plans = NULL;
@@ -1004,7 +1002,6 @@ bool jit_compile(Ops ops, Code *code)
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
         int32_t base = fixed_head ? positions[i] : 0;
-        nob_da_append(&addrs, sb.count);
         {
             size_t end;
             Increment_Carry increment;
@@ -1012,8 +1009,6 @@ bool jit_compile(Ops ops, Code *code)
                 emit_increment_carry(&sb, increment, base);
                 if (!fixed_head) emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
-                for (size_t skipped = i + 1; skipped <= end; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = end;
                 continue;
             }
@@ -1024,16 +1019,12 @@ bool jit_compile(Ops ops, Code *code)
             if (truth_block(ops, i, &end, &truth)) {
                 emit_truth(&sb, truth, base);
                 if (!fixed_head) emit_head_adjust(&sb, truth.source);
-                for (size_t skipped = i + 1; skipped <= end; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = end;
                 continue;
             }
             Complement complement;
             if (complement_block(ops, i, &end, &complement)) {
                 emit_complement(&sb, complement, base);
-                for (size_t skipped = i + 1; skipped <= end; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = end;
                 continue;
             }
@@ -1045,8 +1036,6 @@ bool jit_compile(Ops ops, Code *code)
                 emit_copy(&sb, copy, base);
                 if (!fixed_head) emit_head_adjust(&sb, copy.final_head);
                 if (clear_at(ops, end + 1)) end += 3;
-                for (size_t skipped = i + 1; skipped <= end; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = end;
                 continue;
             }
@@ -1057,8 +1046,6 @@ bool jit_compile(Ops ops, Code *code)
             nob_da_append(&sb, 0xc6);
             emit_modrm_rdi(&sb, 0, base);
             nob_da_append(&sb, (uint8_t)add_amount(ops.items[i + 3]));
-            for (size_t skipped = i + 1; skipped <= i + 3; ++skipped)
-                nob_da_append(&addrs, sb.count);
             i += 3;
             continue;
         }
@@ -1068,8 +1055,6 @@ bool jit_compile(Ops ops, Code *code)
             ops.items[i + 2].kind == OP_JUMP_IF_NONZERO &&
             op.operand == i + 3 && ops.items[i + 2].operand == i + 1) {
             emit_zero(&sb, base);
-            nob_da_append(&addrs, sb.count);
-            nob_da_append(&addrs, sb.count);
             i += 2;
             continue;
         }
@@ -1081,8 +1066,6 @@ bool jit_compile(Ops ops, Code *code)
                 emit_linear(&sb, deltas, source, base);
                 nob_da_free(deltas);
                 if (clear_at(ops, close + 1)) close += 3;
-                for (size_t skipped = i + 1; skipped <= close; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = close;
                 continue;
             }
@@ -1093,8 +1076,6 @@ bool jit_compile(Ops ops, Code *code)
             if (carry_loop(ops, i, &close, &carry)) {
                 emit_carry(&sb, carry, base);
                 if (clear_at(ops, close + 1)) close += 3;
-                for (size_t skipped = i + 1; skipped <= close; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = close;
                 continue;
             }
@@ -1106,8 +1087,6 @@ bool jit_compile(Ops ops, Code *code)
                 if (emit_simple_affine(&sb, affine, base)) free(affine);
                 else emit_affine_call(&sb, affine, base);
                 if (clear_at(ops, close + 1)) close += 3;
-                for (size_t skipped = i + 1; skipped <= close; ++skipped)
-                    nob_da_append(&addrs, sb.count);
                 i = close;
                 continue;
             }
@@ -1181,15 +1160,11 @@ bool jit_compile(Ops ops, Code *code)
                 nob_sb_append_cstr(&sb, "\x0f\x84");     // jz
                 size_t operand_byte_addr = sb.count;
                 nob_da_append_many(&sb, "\x00\x00\x00\x00", 4);
-                size_t src_byte_addr = sb.count;
-
-                Backpatch bp = {
+                Loop_Patch loop = {
                     .operand_byte_addr = operand_byte_addr,
-                    .src_byte_addr = src_byte_addr,
-                    .dst_op_index = op.operand,
+                    .body_byte_addr = sb.count,
                 };
-
-                nob_da_append(&backpatches, bp);
+                nob_da_append(&loops, loop);
             } break;
 
             case OP_JUMP_IF_NONZERO: {
@@ -1200,14 +1175,12 @@ bool jit_compile(Ops ops, Code *code)
                 size_t operand_byte_addr = sb.count;
                 nob_da_append_many(&sb, "\x00\x00\x00\x00", 4);
                 size_t src_byte_addr = sb.count;
-
-                Backpatch bp = {
-                    .operand_byte_addr = operand_byte_addr,
-                    .src_byte_addr = src_byte_addr,
-                    .dst_op_index = op.operand,
-                };
-
-                nob_da_append(&backpatches, bp);
+                assert(loops.count > 0);
+                Loop_Patch loop = loops.items[--loops.count];
+                int32_t relative = (int32_t)(loop.body_byte_addr - src_byte_addr);
+                memcpy(&sb.items[operand_byte_addr], &relative, sizeof(relative));
+                relative = (int32_t)(sb.count - loop.body_byte_addr);
+                memcpy(&sb.items[loop.operand_byte_addr], &relative, sizeof(relative));
             } break;
 
             case OP_FORK: {
@@ -1249,15 +1222,7 @@ bool jit_compile(Ops ops, Code *code)
             default: assert(0 && "Unreachable");
         }
     }
-    nob_da_append(&addrs, sb.count);
-
-    for (size_t i = 0; i < backpatches.count; ++i) {
-        Backpatch bp = backpatches.items[i];
-        int32_t src_addr = bp.src_byte_addr;
-        int32_t dst_addr = addrs.items[bp.dst_op_index];
-        int32_t operand = dst_addr - src_addr;
-        memcpy(&sb.items[bp.operand_byte_addr], &operand, sizeof(operand));
-    }
+    assert(loops.count == 0);
 
     nob_sb_append_cstr(&sb, "\xC3");
 
@@ -1277,8 +1242,7 @@ defer:
         memset(code, 0, sizeof(*code));
     }
     nob_da_free(sb);
-    nob_da_free(backpatches);
-    nob_da_free(addrs);
+    nob_da_free(loops);
     free(positions);
     return result;
 }
