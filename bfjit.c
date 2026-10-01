@@ -28,7 +28,7 @@ typedef enum {
 
 typedef struct {
     Op_Kind kind;
-    size_t operand;
+    uint32_t operand;
 } Op;
 
 typedef struct {
@@ -141,7 +141,7 @@ static int child_ends_here(uint32_t site)
 static void join_thread(uint32_t site)
 {
     Join *join = thread->joins;
-    assert(join && join->site == site);
+    if (!join || join->site != site) abort();
     if (pthread_join(join->thread, NULL) != 0) abort();
     pthread_barrier_destroy(&join->start);
     thread->joins = join->next;
@@ -1333,9 +1333,13 @@ bool generate_ops(const char *file_path, Ops *ops)
                     count += 1;
                     s = lexer_next(&l);
                 }
+                if (count > INT32_MAX) {
+                    printf("%s [%zu]: ERROR: Command run is too long\n", file_path, l.pos);
+                    nob_return_defer(false);
+                }
                 Op op = {
                     .kind = c,
-                    .operand = count,
+                    .operand = (uint32_t)count,
                 };
                 nob_da_append(ops, op);
                 c = s;
@@ -1363,10 +1367,15 @@ bool generate_ops(const char *file_path, Ops *ops)
                 size_t addr = stack.items[--stack.count];
                 Op op = {
                     .kind = c,
-                    .operand = addr + 1,
+                    .operand = (uint32_t)(addr + 1),
                 };
                 nob_da_append(ops, op);
-                ops->items[addr].operand = ops->count;
+                if (ops->count > INT32_MAX) {
+                    printf("%s [%zu]: ERROR: Program has too many operations\n",
+                           file_path, l.pos);
+                    nob_return_defer(false);
+                }
+                ops->items[addr].operand = (uint32_t)ops->count;
 
                 c = lexer_next(&l);
             } break;
