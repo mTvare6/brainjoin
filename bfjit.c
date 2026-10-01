@@ -287,6 +287,9 @@ typedef struct {
     int32_t scratch, flag, carry;
 } Increment_Carry;
 
+typedef struct { int32_t target; } Complement;
+typedef struct { int32_t source; } Truth;
+
 static int64_t add_amount(Op op)
 {
     if (op.kind == OP_INC) return (int64_t)op.operand;
@@ -389,6 +392,52 @@ static bool increment_carry(Ops ops, size_t at, size_t *end,
     if (!shape || carry > INT32_MAX || scratch == carry || flag == carry) return false;
     *result = (Increment_Carry){(int32_t)scratch, (int32_t)flag, (int32_t)carry};
     *end = at + 34;
+    return true;
+}
+
+static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
+{
+    if (at + 17 >= ops.count || !clear_at(ops, at) ||
+        (uint8_t)add_amount(ops.items[at + 3]) != 255) return false;
+    const Op *x = ops.items + at;
+    int64_t target = move_amount(x[4]);
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target_) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == at + (target_))
+#define E(i, target_) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == at + (target_))
+    bool shape = target != INT64_MIN && target && B(5,11) && A(6,-1) &&
+        M(7,-target) && A(8,-1) && M(9,target) && E(10,6) && M(11,-target) &&
+        B(12,18) && A(13,-1) && M(14,target) && A(15,1) &&
+        M(16,-target) && E(17,13);
+#undef A
+#undef M
+#undef B
+#undef E
+    if (!shape || target < INT32_MIN || target > INT32_MAX) return false;
+    *result = (Complement){(int32_t)target};
+    *end = at + 17;
+    return true;
+}
+
+static bool truth_block(Ops ops, size_t at, size_t *end, Truth *result)
+{
+    if (at + 14 >= ops.count || !clear_at(ops, at)) return false;
+    const Op *x = ops.items + at;
+    int64_t source = move_amount(x[3]);
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == at + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == at + (target))
+    bool shape = source != INT64_MIN && source && B(4,15) && clear_at(ops, at + 5) &&
+        M(8,-source) && clear_at(ops, at + 9) && A(12,1) &&
+        M(13,source) && E(14,5);
+#undef A
+#undef M
+#undef B
+#undef E
+    if (!shape || source < INT32_MIN || source > INT32_MAX) return false;
+    *result = (Truth){(int32_t)source};
+    *end = at + 14;
     return true;
 }
 
@@ -772,6 +821,24 @@ static void emit_increment_carry(Nob_String_Builder *sb,
     emit_zero(sb, base + increment.flag);
 }
 
+static void emit_complement(Nob_String_Builder *sb, Complement complement,
+                            int32_t base)
+{
+    nob_da_append(sb, 0xf6); // not byte [target]
+    emit_modrm_rdi(sb, 2, base + complement.target);
+    emit_zero(sb, base);
+}
+
+static void emit_truth(Nob_String_Builder *sb, Truth truth, int32_t base)
+{
+    nob_da_append(sb, 0x80); // cmp byte [source], 0
+    emit_modrm_rdi(sb, 7, base + truth.source);
+    nob_da_append(sb, 0);
+    nob_da_append_many(sb, "\x0f\x95\xc0", 3); // setne al
+    emit_store_byte(sb, 0, base);
+    emit_zero(sb, base + truth.source);
+}
+
 static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
                         int32_t base)
 {
@@ -939,6 +1006,26 @@ bool jit_compile(Ops ops, Code *code)
                 emit_increment_carry(&sb, increment, base);
                 if (!fixed_head) emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
+                for (size_t skipped = i + 1; skipped <= end; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = end;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t end;
+            Truth truth;
+            if (truth_block(ops, i, &end, &truth)) {
+                emit_truth(&sb, truth, base);
+                if (!fixed_head) emit_head_adjust(&sb, truth.source);
+                for (size_t skipped = i + 1; skipped <= end; ++skipped)
+                    nob_da_append(&addrs, sb.count);
+                i = end;
+                continue;
+            }
+            Complement complement;
+            if (complement_block(ops, i, &end, &complement)) {
+                emit_complement(&sb, complement, base);
                 for (size_t skipped = i + 1; skipped <= end; ++skipped)
                     nob_da_append(&addrs, sb.count);
                 i = end;
