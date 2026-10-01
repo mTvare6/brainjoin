@@ -2,7 +2,10 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define NOB_IMPLEMENTATION
 #include "nob.h"
@@ -1280,18 +1283,36 @@ defer:
 bool generate_ops(const char *file_path, Ops *ops)
 {
     bool result = true;
-    Nob_String_Builder sb = {0};
     Addrs stack = {0};
     Forks forks = {0};
     uint32_t next_site = 0;
-
-    if (!nob_read_entire_file(file_path, &sb)) {
-        nob_return_defer(false);
+    int fd = open(file_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        nob_log(NOB_ERROR, "Could not open %s: %s", file_path, strerror(errno));
+        return false;
     }
+    struct stat statbuf;
+    if (fstat(fd, &statbuf) < 0 || statbuf.st_size < 0) {
+        close(fd);
+        nob_log(NOB_ERROR, "Could not stat %s: %s", file_path, strerror(errno));
+        return false;
+    }
+    size_t source_count = (size_t)statbuf.st_size;
+    char *source = NULL;
+    if (source_count) {
+        source = mmap(NULL, source_count, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (source == MAP_FAILED) {
+            close(fd);
+            nob_log(NOB_ERROR, "Could not map %s: %s", file_path, strerror(errno));
+            return false;
+        }
+        madvise(source, source_count, MADV_SEQUENTIAL);
+    }
+    close(fd);
     Lexer l = {
         .content = {
-            .data = sb.items,
-            .count = sb.count,
+            .data = source,
+            .count = source_count,
         },
     };
     char c = lexer_next(&l);
@@ -1401,7 +1422,7 @@ defer:
         nob_da_free(*ops);
         memset(ops, 0, sizeof(*ops));
     }
-    nob_da_free(sb);
+    if (source_count) munmap(source, source_count);
     nob_da_free(stack);
     nob_da_free(forks);
     return result;
