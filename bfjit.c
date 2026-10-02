@@ -1432,6 +1432,14 @@ bool generate_ops(const char *file_path, Ops *ops)
             return false;
         }
         madvise(source, source_count, MADV_SEQUENTIAL);
+        if (!ops->items && source_count / 8 < SIZE_MAX / sizeof(*ops->items)) {
+            size_t capacity = source_count / 8 + 1;
+            Op *items = malloc(capacity * sizeof(*items));
+            if (items) {
+                ops->items = items;
+                ops->capacity = capacity;
+            }
+        }
     }
     close(fd);
     Lexer l = {
