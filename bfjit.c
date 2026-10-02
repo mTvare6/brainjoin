@@ -1437,6 +1437,13 @@ bool generate_ops(const char *file_path, Ops *ops)
             case '-':
             case '+': {
                 size_t start = l.pos;
+                uint64_t repeated = UINT64_C(0x0101010101010101) * (uint8_t)c;
+                while (l.content.count - l.pos >= sizeof(repeated)) {
+                    uint64_t word;
+                    memcpy(&word, l.content.data + l.pos, sizeof(word));
+                    if (word != repeated) break;
+                    l.pos += sizeof(word);
+                }
                 while (l.pos < l.content.count && l.content.data[l.pos] == c)
                     l.pos += 1;
                 size_t count = l.pos - start + 1;
