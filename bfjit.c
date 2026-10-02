@@ -270,6 +270,7 @@ enum { AFFINE_DOWN = 1, AFFINE_UP, AFFINE_IF };
 typedef struct Affine_Plan {
     struct Affine_Plan *next;
     uint32_t count, kind;
+    bool built;
     uint8_t tables[];
 } Affine_Plan;
 
@@ -660,16 +661,25 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
     plan->kind = kind;
     if (kind == AFFINE_IF) {
         memcpy(plan->tables, matrix, cells);
+        plan->built = true;
     } else {
-        memset(plan->tables, 0, cells);
-        for (size_t i = 0; i < width; ++i) plan->tables[i * width + i] = 1;
         memcpy(plan->tables + cells, matrix, cells);
-        for (size_t i = 2; i < 256; ++i)
-            matrix_multiply(plan->tables + i * cells, matrix,
-                            plan->tables + (i - 1) * cells, width);
+        plan->built = false;
     }
     *plans = plan;
     return plan;
+}
+
+static void build_affine_plan(Affine_Plan *plan)
+{
+    if (plan->built) return;
+    size_t width = (size_t)plan->count + 1, cells = width * width;
+    memset(plan->tables, 0, cells);
+    for (size_t i = 0; i < width; ++i) plan->tables[i * width + i] = 1;
+    for (size_t i = 2; i < 256; ++i)
+        matrix_multiply(plan->tables + i * cells, plan->tables + cells,
+                        plan->tables + (i - 1) * cells, width);
+    plan->built = true;
 }
 
 static bool affine_loop(Ops ops, size_t open, size_t *close, Affine **result,
@@ -1114,6 +1124,7 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
+    build_affine_plan((Affine_Plan *)affine->plan);
     nob_da_append(sb, 0x57); // push rdi
     if (base) {
         nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
