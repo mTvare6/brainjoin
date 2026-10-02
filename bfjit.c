@@ -791,7 +791,8 @@ static bool carry_loop(Ops ops, size_t open, size_t *close, Carry *result)
     int64_t low_to_scratch = move_amount(x[4]);
     int64_t flag_to_high = move_amount(x[34]);
     bool shape =
-        A(1,-1) && to_low < 0 && A(3,1) && low_to_scratch > 0 &&
+        A(1,-1) && to_low != INT64_MIN && to_low != 0 &&
+        A(3,1) && low_to_scratch > 0 &&
         B(5,8) && A(6,-1) && E(7,6) && M(8,1) &&
         B(9,12) && A(10,-1) && E(11,10) && A(12,1) &&
         M(13,-(low_to_scratch+1)) &&
