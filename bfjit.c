@@ -292,6 +292,12 @@ typedef struct {
     int32_t scratch, flag, carry;
 } Increment_Carry;
 
+typedef struct {
+    int32_t destinations[32];
+    int32_t zeros[32];
+    uint32_t destination_count, zero_count;
+} Multi_Add;
+
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -397,6 +403,111 @@ static bool increment_carry(Ops ops, size_t at, size_t *end,
     if (!shape || carry > INT32_MAX || scratch == carry || flag == carry) return false;
     *result = (Increment_Carry){(int32_t)scratch, (int32_t)flag, (int32_t)carry};
     *end = at + 34;
+    return true;
+}
+
+static bool take_move(Ops ops, size_t *at, size_t limit, int64_t *head)
+{
+    if (*at >= limit) return true;
+    int64_t amount = move_amount(ops.items[*at]);
+    if (amount == INT64_MIN) return true;
+    *head += amount;
+    *at += 1;
+    return *head >= INT32_MIN && *head <= INT32_MAX;
+}
+
+static bool add_multi_offset(int32_t *items, uint32_t *count, int64_t offset)
+{
+    if (offset < INT32_MIN || offset > INT32_MAX) return false;
+    for (uint32_t i = 0; i < *count; ++i)
+        if (items[i] == offset) return true;
+    if (*count == 32) return false;
+    items[(*count)++] = (int32_t)offset;
+    return true;
+}
+
+static bool multi_add_loop(Ops ops, size_t open, size_t *end,
+                           Multi_Add *result)
+{
+    size_t close = ops.items[open].operand - 1;
+    if (close <= open || close >= ops.count) return false;
+    size_t at = open + 1;
+    int64_t head = 0;
+    Multi_Add add = {0};
+    if (at >= close || add_amount(ops.items[at++]) != -1) return false;
+
+    // incn starts by clearing its two alternating carry cells.
+    for (size_t i = 0; i < 2; ++i) {
+        if (!take_move(ops, &at, close, &head) || at >= close ||
+            !clear_at(ops, at) || at + 2 >= close ||
+            !add_multi_offset(add.zeros, &add.zero_count, head)) return false;
+        at += 3;
+    }
+
+    if (!take_move(ops, &at, close, &head)) return false;
+    size_t increment_end;
+    Increment_Carry increment;
+    if (!increment_carry(ops, at, &increment_end, &increment) ||
+        increment_end >= close) return false;
+    if (!add_multi_offset(add.destinations, &add.destination_count, head) ||
+        !add_multi_offset(add.zeros, &add.zero_count, head + increment.scratch) ||
+        !add_multi_offset(add.zeros, &add.zero_count, head + increment.flag) ||
+        !add_multi_offset(add.zeros, &add.zero_count, head + increment.carry)) return false;
+    int64_t carry = head + increment.carry;
+    head += increment.flag;
+    at = increment_end + 1;
+
+    for (;;) {
+        int64_t current_carry = carry;
+        if (!take_move(ops, &at, close, &head) || at >= close ||
+            !clear_at(ops, at) || at + 2 >= close ||
+            !add_multi_offset(add.zeros, &add.zero_count, head)) return false;
+        int64_t next_carry_cell = head;
+        at += 3;
+        if (!take_move(ops, &at, close, &head) || head != carry ||
+            at >= close || ops.items[at].kind != OP_JUMP_IF_ZERO) return false;
+        size_t carry_close = ops.items[at].operand - 1;
+        if (carry_close <= at || carry_close >= close) return false;
+        at += 1;
+        if (at >= carry_close || add_amount(ops.items[at++]) != -1 ||
+            !take_move(ops, &at, carry_close, &head)) return false;
+
+        bool last = false;
+        if (increment_carry(ops, at, &increment_end, &increment)) {
+            if (increment_end >= carry_close ||
+                !add_multi_offset(add.destinations, &add.destination_count, head) ||
+                !add_multi_offset(add.zeros, &add.zero_count, head + increment.scratch) ||
+                !add_multi_offset(add.zeros, &add.zero_count, head + increment.flag) ||
+                !add_multi_offset(add.zeros, &add.zero_count, head + increment.carry) ||
+                head + increment.carry != next_carry_cell) return false;
+            head += increment.flag;
+            at = increment_end + 1;
+        } else {
+            if (at >= carry_close || add_amount(ops.items[at]) != 1 ||
+                !add_multi_offset(add.destinations, &add.destination_count, head)) return false;
+            at += 1;
+            last = true;
+        }
+        if (!take_move(ops, &at, carry_close, &head) || head != current_carry ||
+            at != carry_close || ops.items[at].kind != OP_JUMP_IF_NONZERO) return false;
+        at += 1;
+        if (last) break;
+        carry = next_carry_cell;
+    }
+
+    if (!take_move(ops, &at, close, &head) || head || at != close ||
+        ops.items[close].kind != OP_JUMP_IF_NONZERO) return false;
+    for (uint32_t i = 0; i < add.destination_count; ++i) {
+        if (!add.destinations[i]) return false;
+        for (uint32_t j = i + 1; j < add.destination_count; ++j)
+            if (add.destinations[i] == add.destinations[j]) return false;
+        for (uint32_t j = 0; j < add.zero_count; ++j)
+            if (add.destinations[i] == add.zeros[j]) return false;
+    }
+    for (uint32_t i = 0; i < add.zero_count; ++i)
+        if (!add.zeros[i]) return false;
+    *result = add;
+    *end = close;
     return true;
 }
 
@@ -826,6 +937,30 @@ static void emit_increment_carry(Nob_String_Builder *sb,
     emit_zero(sb, base + increment.flag);
 }
 
+static void emit_multi_add(Nob_String_Builder *sb, Multi_Add add, int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [source]
+    emit_modrm_rdi(sb, 0, base);
+    nob_sb_append_cstr(sb, "\x85\xc0\x0f\x84"); // test eax, eax; jz done
+    size_t patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t source = sb->count;
+
+    emit_add_byte(sb, false, base + add.destinations[0], 0);
+    for (uint32_t i = 1; i < add.destination_count; ++i) {
+        nob_da_append(sb, 0x80); // adc byte [destination], 0
+        emit_modrm_rdi(sb, 2, base + add.destinations[i]);
+        nob_da_append(sb, 0);
+    }
+    emit_zero(sb, base);
+    for (uint32_t i = 0; i < add.zero_count; ++i)
+        emit_zero(sb, base + add.zeros[i]);
+
+    int32_t relative = (int32_t)(sb->count - source);
+    memcpy(&sb->items[patch], &relative, sizeof(relative));
+}
+
 static void emit_complement(Nob_String_Builder *sb, Complement complement,
                             int32_t base)
 {
@@ -1009,6 +1144,15 @@ bool jit_compile(Ops ops, Code *code)
                 emit_increment_carry(&sb, increment, base);
                 if (!fixed_head) emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
+                i = end;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t end;
+            Multi_Add add;
+            if (multi_add_loop(ops, i, &end, &add)) {
+                emit_multi_add(&sb, add, base);
                 i = end;
                 continue;
             }
