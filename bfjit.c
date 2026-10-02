@@ -1069,16 +1069,13 @@ static bool emit_simple_affine(Nob_String_Builder *sb, const Affine *affine,
     return true;
 }
 
-static bool static_positions(Ops ops, int32_t **result)
+static bool has_static_positions(Ops ops)
 {
-    int32_t *positions = malloc(ops.count * sizeof(*positions));
     int64_t *loops = NULL;
     size_t loop_count = 0, loop_capacity = 0;
-    if (ops.count && !positions) abort();
     int64_t head = 0;
     for (size_t i = 0; i < ops.count; ++i) {
         if (head < INT32_MIN || head > INT32_MAX) goto fail;
-        positions[i] = (int32_t)head;
         Op op = ops.items[i];
         if (op.kind == OP_LEFT) head -= op.operand;
         else if (op.kind == OP_RIGHT) head += op.operand;
@@ -1097,12 +1094,10 @@ static bool static_positions(Ops ops, int32_t **result)
     }
     if (loop_count || head < INT32_MIN || head > INT32_MAX) goto fail;
     free(loops);
-    *result = positions;
     return true;
 
 fail:
     free(loops);
-    free(positions);
     return false;
 }
 
@@ -1143,19 +1138,20 @@ bool jit_compile(Ops ops, Code *code)
     bool result = true;
     Nob_String_Builder sb = {0};
     Loop_Patches loops = {0};
-    int32_t *positions = NULL;
-    bool fixed_head = static_positions(ops, &positions);
+    bool fixed_head = has_static_positions(ops);
+    int64_t static_head = 0;
     Affine_Plan *plans = NULL;
 
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
-        int32_t base = fixed_head ? positions[i] : 0;
+        int32_t base = fixed_head ? (int32_t)static_head : 0;
         {
             size_t end;
             Increment_Carry increment;
             if (increment_carry(ops, i, &end, &increment)) {
                 emit_increment_carry(&sb, increment, base);
-                if (!fixed_head) emit_head_adjust(&sb, increment.flag);
+                if (fixed_head) static_head += increment.flag;
+                else emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
                 i = end;
                 continue;
@@ -1175,7 +1171,8 @@ bool jit_compile(Ops ops, Code *code)
             Truth truth;
             if (truth_block(ops, i, &end, &truth)) {
                 emit_truth(&sb, truth, base);
-                if (!fixed_head) emit_head_adjust(&sb, truth.source);
+                if (fixed_head) static_head += truth.source;
+                else emit_head_adjust(&sb, truth.source);
                 i = end;
                 continue;
             }
@@ -1191,7 +1188,8 @@ bool jit_compile(Ops ops, Code *code)
             Copy copy;
             if (copy_block(ops, i, &end, &copy) || move_block(ops, i, &end, &copy)) {
                 emit_copy(&sb, copy, base);
-                if (!fixed_head) emit_head_adjust(&sb, copy.final_head);
+                if (fixed_head) static_head += copy.final_head;
+                else emit_head_adjust(&sb, copy.final_head);
                 if (clear_at(ops, end + 1)) end += 3;
                 i = end;
                 continue;
@@ -1265,7 +1263,9 @@ bool jit_compile(Ops ops, Code *code)
 
             // TODO: range checks for OP_LEFT and OP_RIGHT
             case OP_LEFT: {
-                if (!fixed_head) {
+                if (fixed_head) {
+                    static_head -= op.operand;
+                } else {
                     nob_sb_append_cstr(&sb, "\x48\x81\xef"); // sub rdi,
                     uint32_t operand = (uint32_t)op.operand;
                     nob_da_append_many(&sb, &operand, sizeof(operand));
@@ -1273,7 +1273,9 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_RIGHT: {
-                if (!fixed_head) {
+                if (fixed_head) {
+                    static_head += op.operand;
+                } else {
                     nob_sb_append_cstr(&sb, "\x48\x81\xc7"); // add rdi,
                     uint32_t operand = (uint32_t)op.operand;
                     nob_da_append_many(&sb, &operand, sizeof(operand));
@@ -1400,7 +1402,6 @@ defer:
     }
     nob_da_free(sb);
     nob_da_free(loops);
-    free(positions);
     return result;
 }
 
