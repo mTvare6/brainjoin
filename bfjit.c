@@ -632,12 +632,13 @@ static uint8_t op_delta(Op op)
 static void matrix_multiply(uint8_t *out, const uint8_t *left,
                             const uint8_t *right, size_t width)
 {
+    memset(out, 0, width * width);
     for (size_t row = 0; row < width; ++row) {
-        for (size_t column = 0; column < width; ++column) {
-            uint32_t sum = 0;
-            for (size_t k = 0; k < width; ++k)
-                sum += (uint32_t)left[row * width + k] * right[k * width + column];
-            out[row * width + column] = (uint8_t)sum;
+        for (size_t k = 0; k < width; ++k) {
+            uint8_t factor = left[row * width + k];
+            if (!factor) continue;
+            for (size_t column = 0; column < width; ++column)
+                out[row * width + column] += factor * right[k * width + column];
         }
     }
 }
