@@ -299,6 +299,10 @@ typedef struct {
     uint32_t destination_count, zero_count;
 } Multi_Add;
 
+typedef struct {
+    int32_t y, copy, temporary, flag, guard, greater;
+} Byte_Compare;
+
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -509,6 +513,63 @@ static bool multi_add_loop(Ops ops, size_t open, size_t *end,
         if (!add.zeros[i]) return false;
     *result = add;
     *end = close;
+    return true;
+}
+
+static bool byte_compare_loop(Ops ops, size_t open, size_t *end,
+                              Byte_Compare *result)
+{
+    if (open + 73 >= ops.count) return false;
+    const Op *x = ops.items + open;
+    int64_t moves[] = {move_amount(x[2]), move_amount(x[6]),
+        move_amount(x[10]), move_amount(x[26]), move_amount(x[42]),
+        move_amount(x[61])};
+    for (size_t i = 0; i < NOB_ARRAY_LEN(moves); ++i)
+        if (moves[i] == INT64_MIN) return false;
+    int64_t copy = moves[0];
+    int64_t temporary = copy + moves[1];
+    int64_t y = temporary + moves[2];
+    int64_t flag = temporary + moves[3];
+    int64_t guard = copy + moves[4];
+    int64_t greater = guard + moves[5];
+#define A(i, amount) (add_amount(x[i]) == (amount))
+#define M(i, amount) (move_amount(x[i]) == (amount))
+#define B(i, target) (x[i].kind == OP_JUMP_IF_ZERO && x[i].operand == open + (target))
+#define E(i, target) (x[i].kind == OP_JUMP_IF_NONZERO && x[i].operand == open + (target))
+    bool shape = B(0,74) && A(1,-1) &&
+        clear_at(ops, open + 3) && M(6,temporary-copy) &&
+        clear_at(ops, open + 7) && M(10,y-temporary) &&
+        B(11,19) && A(12,-1) && M(13,copy-y) && A(14,1) &&
+        M(15,temporary-copy) && A(16,1) && M(17,y-temporary) && E(18,12) &&
+        M(19,temporary-y) && B(20,26) && A(21,-1) &&
+        M(22,y-temporary) && A(23,1) && M(24,temporary-y) && E(25,21) &&
+        M(26,flag-temporary) && clear_at(ops, open + 27) &&
+        M(30,copy-flag) && B(31,42) && clear_at(ops, open + 32) &&
+        M(35,flag-copy) && clear_at(ops, open + 36) && A(39,1) &&
+        M(40,copy-flag) && E(41,32) && M(42,guard-copy) &&
+        clear_at(ops, open + 43) && A(46,1) && M(47,flag-guard) &&
+        B(48,58) && A(49,-1) && M(50,y-flag) && A(51,-1) &&
+        M(52,guard-y) && clear_at(ops, open + 53) &&
+        M(56,flag-guard) && E(57,49) && M(58,guard-flag) &&
+        B(59,72) && A(60,-1) && M(61,greater-guard) &&
+        clear_at(ops, open + 62) && A(65,1) && M(66,-greater) &&
+        clear_at(ops, open + 67) && M(70,guard) && E(71,60) &&
+        M(72,-guard) && E(73,1);
+#undef A
+#undef M
+#undef B
+#undef E
+    int64_t offsets[] = {0, y, copy, temporary, flag, guard, greater};
+    for (size_t i = 0; shape && i < NOB_ARRAY_LEN(offsets); ++i) {
+        if (offsets[i] < INT32_MIN || offsets[i] > INT32_MAX) shape = false;
+        for (size_t j = 0; j < i; ++j)
+            if (offsets[i] == offsets[j]) shape = false;
+    }
+    if (!shape) return false;
+    *result = (Byte_Compare){(int32_t)y, (int32_t)copy,
+        (int32_t)temporary, (int32_t)flag, (int32_t)guard,
+        (int32_t)greater};
+    *end = open + 73;
     return true;
 }
 
@@ -973,6 +1034,50 @@ static void emit_multi_add(Nob_String_Builder *sb, Multi_Add add, int32_t base)
     memcpy(&sb->items[patch], &relative, sizeof(relative));
 }
 
+static void emit_byte_compare(Nob_String_Builder *sb, Byte_Compare compare,
+                              int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [x]
+    emit_modrm_rdi(sb, 0, base);
+    nob_da_append_many(sb, "\x85\xc0\x0f\x84", 4); // test eax, eax; jz done
+    size_t done_patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t done_source = sb->count;
+
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx ecx, byte [y]
+    emit_modrm_rdi(sb, 1, base + compare.y);
+    nob_da_append_many(sb, "\x39\xc8\x0f\x86", 4); // cmp eax, ecx; jbe x_le_y
+    size_t less_patch = sb->count;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t less_source = sb->count;
+
+    nob_da_append(sb, 0xc6); // mov byte [greater], 1
+    emit_modrm_rdi(sb, 0, base + compare.greater);
+    nob_da_append(sb, 1);
+    emit_zero(sb, base + compare.y);
+    nob_da_append(sb, 0xe9); // jmp cleared
+    size_t clear_patch = sb->count;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t clear_source = sb->count;
+
+    int32_t relative = (int32_t)(sb->count - less_source);
+    memcpy(&sb->items[less_patch], &relative, sizeof(relative));
+    nob_sb_append_cstr(sb, "\x29\xc1"); // sub ecx, eax
+    emit_store_byte(sb, 1, base + compare.y);
+
+    relative = (int32_t)(sb->count - clear_source);
+    memcpy(&sb->items[clear_patch], &relative, sizeof(relative));
+    emit_zero(sb, base);
+    emit_zero(sb, base + compare.copy);
+    emit_zero(sb, base + compare.temporary);
+    emit_zero(sb, base + compare.flag);
+    emit_zero(sb, base + compare.guard);
+
+    relative = (int32_t)(sb->count - done_source);
+    memcpy(&sb->items[done_patch], &relative, sizeof(relative));
+}
+
 static void emit_complement(Nob_String_Builder *sb, Complement complement,
                             int32_t base)
 {
@@ -1159,6 +1264,12 @@ bool jit_compile(Ops ops, Code *code)
         }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
+            Byte_Compare compare;
+            if (byte_compare_loop(ops, i, &end, &compare)) {
+                emit_byte_compare(&sb, compare, base);
+                i = end;
+                continue;
+            }
             Multi_Add add;
             if (multi_add_loop(ops, i, &end, &add)) {
                 emit_multi_add(&sb, add, base);
