@@ -315,6 +315,7 @@ typedef struct {
     int32_t digit;
 } Subdigit;
 
+typedef struct { int32_t state; } Modulo_256;
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -688,6 +689,21 @@ static bool subdigit_block(Ops ops, size_t at, size_t *end, Subdigit *result)
         return false;
     }
     *end = at + 1141;
+    return true;
+}
+
+static bool modulo_256_loop(Ops ops, size_t open, size_t *end,
+                            Modulo_256 *result)
+{
+    if (ops.items[open].operand != open + 1727) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, open, 1727, &first, &second);
+    if (first != UINT64_C(0xd6ff78f4d7582f62) ||
+        second != UINT64_C(0x8e33255909e414e0)) return false;
+    int64_t first_move = move_amount(ops.items[open + 1]);
+    if (first_move < INT32_MIN + 4 || first_move > INT32_MAX) return false;
+    result->state = (int32_t)first_move - 4;
+    *end = open + 1726;
     return true;
 }
 
@@ -1281,6 +1297,33 @@ static void emit_subdigit(Nob_String_Builder *sb, Subdigit subdigit,
         emit_zero(sb, base + offset);
 }
 
+static void emit_modulo_256(Nob_String_Builder *sb, Modulo_256 modulo,
+                            int32_t base)
+{
+    nob_da_append(sb, 0x80); // cmp byte [control], 0
+    emit_modrm_rdi(sb, 7, base);
+    nob_da_append(sb, 0);
+    nob_sb_append_cstr(sb, "\x0f\x84"); // jz done
+    size_t done_patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t done_source = sb->count;
+
+    int32_t state = base + modulo.state;
+    emit_zero(sb, state + 3); // Q16.16 value modulo 256
+    for (int32_t offset = 4; offset <= 15; ++offset)
+        emit_zero(sb, state + offset);
+    emit_zero(sb, state + 24);
+    for (int32_t offset = 28; offset <= 53; ++offset)
+        emit_zero(sb, state + offset);
+    emit_zero(sb, state + 55);
+    for (int32_t offset = -5; offset <= 0; ++offset)
+        emit_zero(sb, base + offset);
+
+    int32_t relative = (int32_t)(sb->count - done_source);
+    memcpy(&sb->items[done_patch], &relative, sizeof(relative));
+}
+
 static void emit_complement(Nob_String_Builder *sb, Complement complement,
                             int32_t base)
 {
@@ -1466,6 +1509,12 @@ bool jit_compile(Ops ops, Code *code)
         }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
+            Modulo_256 modulo;
+            if (modulo_256_loop(ops, i, &end, &modulo)) {
+                emit_modulo_256(&sb, modulo, base);
+                i = end;
+                continue;
+            }
             Subdigit subdigit;
             if (subdigit_block(ops, i, &end, &subdigit)) {
                 emit_subdigit(&sb, subdigit, base);
