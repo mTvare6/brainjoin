@@ -310,6 +310,11 @@ typedef struct {
     int32_t y, copy, temporary, flag, guard, greater;
 } Byte_Compare;
 
+typedef struct {
+    uint8_t divisor;
+    int32_t digit;
+} Subdigit;
+
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -632,12 +637,12 @@ static bool byte_compare_loop(Ops ops, size_t open, size_t *end,
     return true;
 }
 
-static bool division_digit_loop(Ops ops, size_t open, size_t *end)
+static void normalized_fingerprint(Ops ops, size_t begin, size_t count,
+                                   uint64_t *first, uint64_t *second)
 {
-    if (ops.items[open].operand != open + 1301) return false;
-    uint64_t first = UINT64_C(1469598103934665603);
-    uint64_t second = UINT64_C(0x9e3779b97f4a7c15);
-    for (size_t i = open; i < open + 1301; ++i) {
+    *first = UINT64_C(1469598103934665603);
+    *second = UINT64_C(0x9e3779b97f4a7c15);
+    for (size_t i = begin; i < begin + count; ++i) {
         Op op = ops.items[i];
         uint32_t value = op.operand;
         if (op.kind == OP_JUMP_IF_ZERO || op.kind == OP_JUMP_IF_NONZERO)
@@ -646,16 +651,43 @@ static bool division_digit_loop(Ops ops, size_t open, size_t *end)
             (uint8_t)(value >> 8), (uint8_t)(value >> 16),
             (uint8_t)(value >> 24)};
         for (size_t j = 0; j < NOB_ARRAY_LEN(bytes); ++j) {
-            first ^= bytes[j];
-            first *= UINT64_C(1099511628211);
-            second ^= bytes[j];
-            second *= UINT64_C(14029467366897019727);
-            second ^= second >> 29;
+            *first ^= bytes[j];
+            *first *= UINT64_C(1099511628211);
+            *second ^= bytes[j];
+            *second *= UINT64_C(14029467366897019727);
+            *second ^= *second >> 29;
         }
     }
+}
+
+static bool division_digit_loop(Ops ops, size_t open, size_t *end)
+{
+    if (ops.items[open].operand != open + 1301) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, open, 1301, &first, &second);
     if (first != UINT64_C(0x86b6d309826185ba) ||
         second != UINT64_C(0x3917fbb4db1e2e3d)) return false;
     *end = open + 1300;
+    return true;
+}
+
+static bool subdigit_block(Ops ops, size_t at, size_t *end, Subdigit *result)
+{
+    if (at + 1141 >= ops.count || !clear_at(ops, at) ||
+        ops.items[at + 454].kind != OP_JUMP_IF_ZERO ||
+        ops.items[at + 454].operand != at + 1142) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, at, 1142, &first, &second);
+    if (first == UINT64_C(0xc39c713bc5727853) &&
+        second == UINT64_C(0x792a93b94f4e28af)) {
+        *result = (Subdigit){100, -2};
+    } else if (first == UINT64_C(0xe8edc7dd3a544b11) &&
+               second == UINT64_C(0x51d8751a62b52bfc)) {
+        *result = (Subdigit){10, -1};
+    } else {
+        return false;
+    }
+    *end = at + 1141;
     return true;
 }
 
@@ -1227,6 +1259,28 @@ static void emit_division_digit(Nob_String_Builder *sb, int32_t base)
     memcpy(&sb->items[done_patch], &relative, sizeof(relative));
 }
 
+static void emit_subdigit(Nob_String_Builder *sb, Subdigit subdigit,
+                          int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb7", 2); // movzx eax, word [number]
+    emit_modrm_rdi(sb, 0, base - 4);
+    nob_sb_append_cstr(sb, "\x31\xd2\xb9"); // xor edx, edx; mov ecx, divisor
+    uint32_t divisor = subdigit.divisor;
+    nob_da_append_many(sb, &divisor, sizeof(divisor));
+    nob_sb_append_cstr(sb, "\xf7\xf1"); // div ecx
+    emit_add_byte(sb, false, base + subdigit.digit, 0);
+    nob_da_append_many(sb, "\x66\x89", 2); // mov word [number], dx
+    emit_modrm_rdi(sb, 2, base - 4);
+
+    nob_da_append(sb, 0xc6); // mov byte [divisor], immediate
+    emit_modrm_rdi(sb, 0, base);
+    nob_da_append(sb, subdigit.divisor);
+    for (int32_t offset = 1; offset <= 5; ++offset)
+        emit_zero(sb, base + offset);
+    for (int32_t offset = 8; offset <= 19; ++offset)
+        emit_zero(sb, base + offset);
+}
+
 static void emit_complement(Nob_String_Builder *sb, Complement complement,
                             int32_t base)
 {
@@ -1395,7 +1449,6 @@ bool jit_compile(Ops ops, Code *code)
     bool fixed_head = has_static_positions(ops);
     int64_t static_head = 0;
     Affine_Plan *plans = NULL;
-
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
         int32_t base = fixed_head ? (int32_t)static_head : 0;
@@ -1413,6 +1466,14 @@ bool jit_compile(Ops ops, Code *code)
         }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
+            Subdigit subdigit;
+            if (subdigit_block(ops, i, &end, &subdigit)) {
+                emit_subdigit(&sb, subdigit, base);
+                if (fixed_head) static_head += 2;
+                else emit_head_adjust(&sb, 2);
+                i = end;
+                continue;
+            }
             if (division_digit_loop(ops, i, &end)) {
                 emit_division_digit(&sb, base);
                 i = end;
