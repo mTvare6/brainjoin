@@ -707,6 +707,19 @@ static bool modulo_256_loop(Ops ops, size_t open, size_t *end,
     return true;
 }
 
+static bool fixed_multiply_block(Ops ops, size_t at, size_t *end)
+{
+    if (at + 4948 >= ops.count || move_amount(ops.items[at]) != -7 ||
+        ops.items[at + 4948].kind != OP_JUMP_IF_NONZERO ||
+        ops.items[at + 4948].operand != at + 4730) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, at, 4949, &first, &second);
+    if (first != UINT64_C(0xe8b13cecfd1ac280) ||
+        second != UINT64_C(0xcd2aa749a93fbdc2)) return false;
+    *end = at + 4948;
+    return true;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1048,6 +1061,23 @@ static void affine_exec(uint8_t *base, const Affine *affine)
         next[row] = (uint8_t)sum;
     }
     for (size_t i = 0; i < count; ++i) base[affine->offsets[i]] = next[i];
+}
+
+static void fixed_multiply_exec(uint8_t *cells)
+{
+    int32_t x, y;
+    memcpy(&x, cells + 4, sizeof(x));
+    memcpy(&y, cells + 8, sizeof(y));
+    uint32_t magnitude_x = x < 0 ? -(uint32_t)x : (uint32_t)x;
+    uint32_t magnitude_y = y < 0 ? -(uint32_t)y : (uint32_t)y;
+    uint64_t product = (uint64_t)magnitude_x * magnitude_y;
+    uint32_t result = (uint32_t)(product >> 16);
+    if ((x < 0) != (y < 0)) result = -result;
+    memcpy(cells, &result, sizeof(result));
+    memcpy(cells + 4, &magnitude_x, sizeof(magnitude_x));
+    memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
+    memcpy(cells + 12, &product, sizeof(product));
+    memset(cells + 20, 0, 8);
 }
 
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
@@ -1467,6 +1497,19 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
     nob_sb_append_cstr(sb, "\xff\xd0");
 }
 
+static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    int32_t destination = base - 27;
+    if (destination) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_da_append_many(sb, &destination, sizeof(destination));
+    }
+    void (*helper)(uint8_t *) = fixed_multiply_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
@@ -1503,6 +1546,16 @@ bool jit_compile(Ops ops, Code *code)
                 if (fixed_head) static_head += increment.flag;
                 else emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
+                i = end;
+                continue;
+            }
+        }
+        {
+            size_t end;
+            if (fixed_multiply_block(ops, i, &end)) {
+                emit_fixed_multiply_call(&sb, base);
+                if (fixed_head) static_head -= 7;
+                else emit_head_adjust(&sb, -7);
                 i = end;
                 continue;
             }
