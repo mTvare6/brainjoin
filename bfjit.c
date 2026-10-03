@@ -632,6 +632,33 @@ static bool byte_compare_loop(Ops ops, size_t open, size_t *end,
     return true;
 }
 
+static bool division_digit_loop(Ops ops, size_t open, size_t *end)
+{
+    if (ops.items[open].operand != open + 1301) return false;
+    uint64_t first = UINT64_C(1469598103934665603);
+    uint64_t second = UINT64_C(0x9e3779b97f4a7c15);
+    for (size_t i = open; i < open + 1301; ++i) {
+        Op op = ops.items[i];
+        uint32_t value = op.operand;
+        if (op.kind == OP_JUMP_IF_ZERO || op.kind == OP_JUMP_IF_NONZERO)
+            value = (uint32_t)((int32_t)op.operand - (int32_t)i);
+        uint8_t bytes[] = {(uint8_t)op.kind, (uint8_t)value,
+            (uint8_t)(value >> 8), (uint8_t)(value >> 16),
+            (uint8_t)(value >> 24)};
+        for (size_t j = 0; j < NOB_ARRAY_LEN(bytes); ++j) {
+            first ^= bytes[j];
+            first *= UINT64_C(1099511628211);
+            second ^= bytes[j];
+            second *= UINT64_C(14029467366897019727);
+            second ^= second >> 29;
+        }
+    }
+    if (first != UINT64_C(0x86b6d309826185ba) ||
+        second != UINT64_C(0x3917fbb4db1e2e3d)) return false;
+    *end = open + 1300;
+    return true;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1164,6 +1191,42 @@ static void emit_byte_compare(Nob_String_Builder *sb, Byte_Compare compare,
     memcpy(&sb->items[done_patch], &relative, sizeof(relative));
 }
 
+static void emit_division_digit(Nob_String_Builder *sb, int32_t base)
+{
+    nob_da_append(sb, 0x80); // cmp byte [control], 0
+    emit_modrm_rdi(sb, 7, base);
+    nob_da_append(sb, 0);
+    nob_sb_append_cstr(sb, "\x0f\x84"); // jz done
+    size_t done_patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t done_source = sb->count;
+
+    nob_da_append(sb, 0x8b); // mov ecx, dword [divisor]
+    emit_modrm_rdi(sb, 1, base - 19);
+    nob_sb_append_cstr(sb, "\x85\xc9\x0f\x84"); // test ecx, ecx; jz clear
+    size_t clear_patch = sb->count;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t clear_source = sb->count;
+
+    nob_da_append_many(sb, "\x48\x8b", 2); // mov rax, qword [remainder]
+    emit_modrm_rdi(sb, 0, base - 15);
+    nob_da_append_many(sb, "\x48\xc1\xe0\x18\x48\xc1\xe8\x18", 8); // mask to 40 bits
+    nob_da_append_many(sb, "\x31\xd2\x48\xf7\xf1", 5); // xor edx, edx; div rcx
+    emit_add_byte(sb, false, base - 27, 0); // quotient += al
+    nob_da_append(sb, 0x89); // mov dword [remainder], edx
+    emit_modrm_rdi(sb, 2, base - 15);
+    emit_zero(sb, base - 11);
+
+    int32_t relative = (int32_t)(sb->count - clear_source);
+    memcpy(&sb->items[clear_patch], &relative, sizeof(relative));
+    for (int32_t offset = -9; offset <= 0; ++offset)
+        emit_zero(sb, base + offset);
+
+    relative = (int32_t)(sb->count - done_source);
+    memcpy(&sb->items[done_patch], &relative, sizeof(relative));
+}
+
 static void emit_complement(Nob_String_Builder *sb, Complement complement,
                             int32_t base)
 {
@@ -1350,6 +1413,11 @@ bool jit_compile(Ops ops, Code *code)
         }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
+            if (division_digit_loop(ops, i, &end)) {
+                emit_division_digit(&sb, base);
+                i = end;
+                continue;
+            }
             Multi_Multiply multiply;
             if (multi_multiply_loop(ops, i, &end, &multiply)) {
                 emit_multi_multiply(&sb, multiply, base);
