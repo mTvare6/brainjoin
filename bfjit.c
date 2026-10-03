@@ -300,6 +300,13 @@ typedef struct {
 } Multi_Add;
 
 typedef struct {
+    int32_t multiplier;
+    int32_t destinations[32];
+    int32_t zeros[34];
+    uint32_t destination_count, zero_count;
+} Multi_Multiply;
+
+typedef struct {
     int32_t y, copy, temporary, flag, guard, greater;
 } Byte_Compare;
 
@@ -512,6 +519,58 @@ static bool multi_add_loop(Ops ops, size_t open, size_t *end,
     for (uint32_t i = 0; i < add.zero_count; ++i)
         if (!add.zeros[i]) return false;
     *result = add;
+    *end = close;
+    return true;
+}
+
+static bool multi_multiply_loop(Ops ops, size_t open, size_t *end,
+                                Multi_Multiply *result)
+{
+    size_t close = ops.items[open].operand - 1;
+    if (close <= open + 5 || close >= ops.count ||
+        add_amount(ops.items[open + 1]) != -1) return false;
+    int64_t counter = move_amount(ops.items[open + 2]);
+    if (!counter || counter == INT64_MIN) return false;
+
+    size_t copy_end;
+    Copy copy;
+    if (!copy_block(ops, open + 3, &copy_end, &copy) || copy.destructive ||
+        copy_end + 3 >= close ||
+        move_amount(ops.items[copy_end + 1]) != -copy.final_head) return false;
+
+    size_t inner = copy_end + 2, inner_end;
+    Multi_Add add;
+    if (!multi_add_loop(ops, inner, &inner_end, &add) ||
+        inner_end + 2 != close ||
+        move_amount(ops.items[inner_end + 1]) != -counter ||
+        ops.items[close].kind != OP_JUMP_IF_NONZERO ||
+        ops.items[close].operand != open + 1) return false;
+
+    int64_t multiplier = counter + copy.source;
+    if (!multiplier || multiplier < INT32_MIN || multiplier > INT32_MAX)
+        return false;
+    Multi_Multiply multiply = {.multiplier = (int32_t)multiplier};
+    for (uint32_t i = 0; i < add.destination_count; ++i) {
+        int64_t destination = counter + add.destinations[i];
+        if (!destination || destination == multiplier ||
+            destination < INT32_MIN || destination > INT32_MAX) return false;
+        for (uint32_t j = 0; j < multiply.destination_count; ++j)
+            if (multiply.destinations[j] == destination) return false;
+        multiply.destinations[multiply.destination_count++] = (int32_t)destination;
+    }
+    int64_t temporary = counter + copy.temporary;
+    if (!add_multi_offset(multiply.zeros, &multiply.zero_count, counter) ||
+        !add_multi_offset(multiply.zeros, &multiply.zero_count, temporary)) return false;
+    for (uint32_t i = 0; i < add.zero_count; ++i)
+        if (!add_multi_offset(multiply.zeros, &multiply.zero_count,
+                              counter + add.zeros[i])) return false;
+    for (uint32_t i = 0; i < multiply.zero_count; ++i) {
+        int32_t zero = multiply.zeros[i];
+        if (!zero || zero == multiply.multiplier) return false;
+        for (uint32_t j = 0; j < multiply.destination_count; ++j)
+            if (zero == multiply.destinations[j]) return false;
+    }
+    *result = multiply;
     *end = close;
     return true;
 }
@@ -1034,6 +1093,33 @@ static void emit_multi_add(Nob_String_Builder *sb, Multi_Add add, int32_t base)
     memcpy(&sb->items[patch], &relative, sizeof(relative));
 }
 
+static void emit_multi_multiply(Nob_String_Builder *sb,
+                                Multi_Multiply multiply, int32_t base)
+{
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [source]
+    emit_modrm_rdi(sb, 0, base);
+    nob_sb_append_cstr(sb, "\x85\xc0\x0f\x84"); // test eax, eax; jz done
+    size_t patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t source = sb->count;
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx ecx, byte [multiplier]
+    emit_modrm_rdi(sb, 1, base + multiply.multiplier);
+    nob_da_append_many(sb, "\x0f\xaf\xc1", 3); // imul eax, ecx
+    for (uint32_t i = 0; i < multiply.destination_count; ++i) {
+        nob_da_append_many(sb, "\x0f\xb6", 2); // movzx ecx, byte [destination]
+        emit_modrm_rdi(sb, 1, base + multiply.destinations[i]);
+        nob_sb_append_cstr(sb, "\x01\xc8"); // add eax, ecx
+        emit_store_byte(sb, 0, base + multiply.destinations[i]);
+        nob_da_append_many(sb, "\xc1\xe8\x08", 3); // shr eax, 8
+    }
+    emit_zero(sb, base);
+    for (uint32_t i = 0; i < multiply.zero_count; ++i)
+        emit_zero(sb, base + multiply.zeros[i]);
+    int32_t relative = (int32_t)(sb->count - source);
+    memcpy(&sb->items[patch], &relative, sizeof(relative));
+}
+
 static void emit_byte_compare(Nob_String_Builder *sb, Byte_Compare compare,
                               int32_t base)
 {
@@ -1264,6 +1350,12 @@ bool jit_compile(Ops ops, Code *code)
         }
         if (op.kind == OP_JUMP_IF_ZERO) {
             size_t end;
+            Multi_Multiply multiply;
+            if (multi_multiply_loop(ops, i, &end, &multiply)) {
+                emit_multi_multiply(&sb, multiply, base);
+                i = end;
+                continue;
+            }
             Byte_Compare compare;
             if (byte_compare_loop(ops, i, &end, &compare)) {
                 emit_byte_compare(&sb, compare, base);
