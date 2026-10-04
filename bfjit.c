@@ -316,6 +316,10 @@ typedef struct {
 } Subdigit;
 
 typedef struct { int32_t state; } Modulo_256;
+typedef struct {
+    int32_t destination, final_head;
+    uint8_t comparison;
+} Fixed_Compare;
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -733,6 +737,39 @@ static bool fixed_sqrt_block(Ops ops, size_t at, size_t *end)
     return true;
 }
 
+enum { COMPARE_LT, COMPARE_LE, COMPARE_GT, COMPARE_GE, COMPARE_EQ };
+
+static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
+                                Fixed_Compare *result)
+{
+    if (!clear_at(ops, at) || at + 3 >= ops.count ||
+        add_amount(ops.items[at + 3]) != 128) return false;
+    struct Candidate {
+        size_t count;
+        uint64_t first, second;
+        uint8_t comparison;
+    } candidates[] = {
+        {774, UINT64_C(0xfb15b19b43e5f41d), UINT64_C(0x0c452d728dbf0803), COMPARE_LT},
+        {777, UINT64_C(0x15c8cc967a1a634f), UINT64_C(0xc4a1e9983799f343), COMPARE_LE},
+        {774, UINT64_C(0x6fa6ea9db65bc43d), UINT64_C(0xdd13190e138cef08), COMPARE_GT},
+        {777, UINT64_C(0xd5bfb2958c8d1fef), UINT64_C(0x37d94924049cab66), COMPARE_GE},
+        {757, UINT64_C(0x43d9c19d9d1b9057), UINT64_C(0x04ef24b71c17b3af), COMPARE_EQ},
+    };
+    for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
+        size_t count = candidates[candidate].count;
+        if (at + count > ops.count) continue;
+        uint64_t first, second;
+        normalized_fingerprint(ops, at, count, &first, &second);
+        if (first != candidates[candidate].first ||
+            second != candidates[candidate].second) continue;
+        *result = (Fixed_Compare){-24, -10,
+                                  candidates[candidate].comparison};
+        *end = at + count - 1;
+        return true;
+    }
+    return false;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1118,6 +1155,29 @@ static void fixed_sqrt_exec(uint8_t *cells)
     if (subtracted) trial = 0;
     memcpy(cells + 16, &trial, sizeof(trial));
     memset(cells + 20, 0, 8);
+}
+
+static void fixed_compare_exec(uint8_t *cells, uint32_t comparison)
+{
+    int32_t x, y;
+    memcpy(&x, cells + 4, sizeof(x));
+    memcpy(&y, cells + 8, sizeof(y));
+    bool value;
+    switch (comparison) {
+        case COMPARE_LT: value = x < y; break;
+        case COMPARE_LE: value = x <= y; break;
+        case COMPARE_GT: value = x > y; break;
+        case COMPARE_GE: value = x >= y; break;
+        case COMPARE_EQ: value = x == y; break;
+        default: assert(0 && "unreachable"); value = false;
+    }
+    uint32_t biased_x = (uint32_t)x ^ UINT32_C(0x80000000);
+    uint32_t biased_y = (uint32_t)y ^ UINT32_C(0x80000000);
+    memset(cells, 0, 4);
+    cells[0] = value;
+    memcpy(cells + 4, &biased_x, sizeof(biased_x));
+    memcpy(cells + 8, &biased_y, sizeof(biased_y));
+    memset(cells + 12, 0, 14);
 }
 
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
@@ -1563,6 +1623,23 @@ static void emit_fixed_sqrt_call(Nob_String_Builder *sb, int32_t base)
     nob_da_append(sb, 0x5f); // pop rdi
 }
 
+static void emit_fixed_compare_call(Nob_String_Builder *sb,
+                                    Fixed_Compare compare, int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    int32_t destination = base + compare.destination;
+    if (destination) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_da_append_many(sb, &destination, sizeof(destination));
+    }
+    nob_da_append(sb, 0xbe); // mov esi, comparison
+    uint32_t comparison = compare.comparison;
+    nob_da_append_many(sb, &comparison, sizeof(comparison));
+    void (*helper)(uint8_t *, uint32_t) = fixed_compare_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
@@ -1605,6 +1682,14 @@ bool jit_compile(Ops ops, Code *code)
         }
         {
             size_t end;
+            Fixed_Compare compare;
+            if (fixed_compare_block(ops, i, &end, &compare)) {
+                emit_fixed_compare_call(&sb, compare, base);
+                if (fixed_head) static_head += compare.final_head;
+                else emit_head_adjust(&sb, compare.final_head);
+                i = end;
+                continue;
+            }
             if (fixed_sqrt_block(ops, i, &end)) {
                 emit_fixed_sqrt_call(&sb, base);
                 if (fixed_head) static_head -= 12;
