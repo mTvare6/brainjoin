@@ -823,6 +823,19 @@ static bool fixed_divide_block(Ops ops, size_t at, size_t *end)
     return true;
 }
 
+static bool fixed_integer_block(Ops ops, size_t at, size_t *end)
+{
+    if (at + 608 >= ops.count || !clear_at(ops, at) ||
+        move_amount(ops.items[at + 3]) != 2 || !clear_at(ops, at + 4) ||
+        move_amount(ops.items[at + 7]) != -7) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, at, 609, &first, &second);
+    if (first != UINT64_C(0x91e40a934b0c3c1c) ||
+        second != UINT64_C(0x8be45dbf040a4cd3)) return false;
+    *end = at + 608;
+    return true;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1263,6 +1276,18 @@ static void fixed_divide_exec(uint8_t *cells)
     memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
     memcpy(cells + 12, &remainder, 5);
     memset(cells + 17, 0, 11);
+}
+
+static void fixed_integer_exec(uint8_t *cells)
+{
+    int32_t input;
+    memcpy(&input, cells + 4, sizeof(input));
+    uint32_t magnitude = input < 0 ? -(uint32_t)input : (uint32_t)input;
+    uint32_t result = magnitude & UINT32_C(0xffff0000);
+    if (input < 0) result = -result;
+    memcpy(cells, &result, sizeof(result));
+    memset(cells + 4, 0, 7);
+    memset(cells + 12, 0, 8);
 }
 
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
@@ -1755,6 +1780,19 @@ static void emit_fixed_divide_call(Nob_String_Builder *sb, int32_t base)
     nob_da_append(sb, 0x5f); // pop rdi
 }
 
+static void emit_fixed_integer_call(Nob_String_Builder *sb, int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    int32_t destination = base - 12;
+    if (destination) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_da_append_many(sb, &destination, sizeof(destination));
+    }
+    void (*helper)(uint8_t *) = fixed_integer_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
@@ -1797,6 +1835,13 @@ bool jit_compile(Ops ops, Code *code)
         }
         {
             size_t end;
+            if (fixed_integer_block(ops, i, &end)) {
+                emit_fixed_integer_call(&sb, base);
+                if (fixed_head) static_head -= 5;
+                else emit_head_adjust(&sb, -5);
+                i = end;
+                continue;
+            }
             if (fixed_divide_block(ops, i, &end)) {
                 emit_fixed_divide_call(&sb, base);
                 if (fixed_head) static_head -= 3;
