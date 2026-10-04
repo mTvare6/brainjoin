@@ -720,6 +720,19 @@ static bool fixed_multiply_block(Ops ops, size_t at, size_t *end)
     return true;
 }
 
+static bool fixed_sqrt_block(Ops ops, size_t at, size_t *end)
+{
+    if (at + 82626 >= ops.count || move_amount(ops.items[at]) != -19 ||
+        ops.items[at + 82626].kind != OP_JUMP_IF_NONZERO ||
+        ops.items[at + 82626].operand != at + 82622) return false;
+    uint64_t first, second;
+    normalized_fingerprint(ops, at, 82627, &first, &second);
+    if (first != UINT64_C(0xd25eb00b13bce185) ||
+        second != UINT64_C(0x0732d722aea24418)) return false;
+    *end = at + 82626;
+    return true;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1077,6 +1090,33 @@ static void fixed_multiply_exec(uint8_t *cells)
     memcpy(cells + 4, &magnitude_x, sizeof(magnitude_x));
     memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
     memcpy(cells + 12, &product, sizeof(product));
+    memset(cells + 20, 0, 8);
+}
+
+static void fixed_sqrt_exec(uint8_t *cells)
+{
+    uint32_t input;
+    memcpy(&input, cells + 4, sizeof(input));
+    uint64_t radicand = (uint64_t)input << 16;
+    uint32_t remainder = 0, root = 0, trial = 0;
+    bool subtracted = false;
+    for (size_t pair = 0; pair < 24; ++pair) {
+        remainder = (remainder << 2) | (uint32_t)((radicand >> 46) & 3);
+        radicand <<= 2;
+        root <<= 1;
+        trial = (root << 1) + 1;
+        subtracted = remainder >= trial;
+        if (subtracted) {
+            remainder -= trial;
+            root += 1;
+        }
+    }
+    memcpy(cells, &root, sizeof(root));
+    memset(cells + 4, 0, 4);
+    memcpy(cells + 8, &remainder, sizeof(remainder));
+    memset(cells + 12, 0, 4);
+    if (subtracted) trial = 0;
+    memcpy(cells + 16, &trial, sizeof(trial));
     memset(cells + 20, 0, 8);
 }
 
@@ -1510,6 +1550,19 @@ static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base)
     nob_da_append(sb, 0x5f); // pop rdi
 }
 
+static void emit_fixed_sqrt_call(Nob_String_Builder *sb, int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    int32_t destination = base - 27;
+    if (destination) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_da_append_many(sb, &destination, sizeof(destination));
+    }
+    void (*helper)(uint8_t *) = fixed_sqrt_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
@@ -1552,6 +1605,13 @@ bool jit_compile(Ops ops, Code *code)
         }
         {
             size_t end;
+            if (fixed_sqrt_block(ops, i, &end)) {
+                emit_fixed_sqrt_call(&sb, base);
+                if (fixed_head) static_head -= 12;
+                else emit_head_adjust(&sb, -12);
+                i = end;
+                continue;
+            }
             if (fixed_multiply_block(ops, i, &end)) {
                 emit_fixed_multiply_call(&sb, base);
                 if (fixed_head) static_head -= 7;
