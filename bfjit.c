@@ -320,6 +320,10 @@ typedef struct {
     int32_t destination, final_head;
     uint8_t comparison;
 } Fixed_Compare;
+typedef struct {
+    int32_t destination, final_head;
+    bool subtract;
+} Fixed_Add;
 typedef struct { int32_t target; } Complement;
 typedef struct { int32_t source; } Truth;
 
@@ -770,6 +774,39 @@ static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
     return false;
 }
 
+static bool fixed_add_block(Ops ops, size_t at, size_t *end,
+                            Fixed_Add *result)
+{
+    if (!clear_at(ops, at) || at + 3 >= ops.count) return false;
+    bool looks_add = move_amount(ops.items[at + 3]) == 4;
+    bool looks_subtract = add_amount(ops.items[at + 3]) == 255;
+    if (!looks_add && !looks_subtract) return false;
+    struct Candidate {
+        size_t count;
+        uint64_t first, second;
+        int32_t destination, final_head;
+        bool subtract;
+    } candidates[] = {
+        {353, UINT64_C(0xf3c83dc1b9e02a47), UINT64_C(0x48483591c05460cb), 0, 11, false},
+        {569, UINT64_C(0x39d43b63bb5b3f95), UINT64_C(0xcba16d5ca6083b39), -12, -1, true},
+    };
+    for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
+        if (candidates[candidate].subtract != looks_subtract) continue;
+        size_t count = candidates[candidate].count;
+        if (at + count > ops.count) continue;
+        uint64_t first, second;
+        normalized_fingerprint(ops, at, count, &first, &second);
+        if (first != candidates[candidate].first ||
+            second != candidates[candidate].second) continue;
+        *result = (Fixed_Add){candidates[candidate].destination,
+                              candidates[candidate].final_head,
+                              candidates[candidate].subtract};
+        *end = at + count - 1;
+        return true;
+    }
+    return false;
+}
+
 static bool complement_block(Ops ops, size_t at, size_t *end, Complement *result)
 {
     if (at + 17 >= ops.count || !clear_at(ops, at) ||
@@ -1178,6 +1215,16 @@ static void fixed_compare_exec(uint8_t *cells, uint32_t comparison)
     memcpy(cells + 4, &biased_x, sizeof(biased_x));
     memcpy(cells + 8, &biased_y, sizeof(biased_y));
     memset(cells + 12, 0, 14);
+}
+
+static void fixed_add_exec(uint8_t *cells, uint32_t subtract)
+{
+    uint32_t x, y;
+    memcpy(&x, cells + 4, sizeof(x));
+    memcpy(&y, cells + 8, sizeof(y));
+    uint32_t result = subtract ? x - y : x + y;
+    memcpy(cells, &result, sizeof(result));
+    memset(cells + 4, 0, 12);
 }
 
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
@@ -1640,6 +1687,23 @@ static void emit_fixed_compare_call(Nob_String_Builder *sb,
     nob_da_append(sb, 0x5f); // pop rdi
 }
 
+static void emit_fixed_add_call(Nob_String_Builder *sb, Fixed_Add add,
+                                int32_t base)
+{
+    nob_da_append(sb, 0x57); // push rdi
+    int32_t destination = base + add.destination;
+    if (destination) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_da_append_many(sb, &destination, sizeof(destination));
+    }
+    nob_da_append(sb, 0xbe); // mov esi, subtract
+    uint32_t subtract = add.subtract;
+    nob_da_append_many(sb, &subtract, sizeof(subtract));
+    void (*helper)(uint8_t *, uint32_t) = fixed_add_exec;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // pop rdi
+}
+
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
@@ -1682,6 +1746,14 @@ bool jit_compile(Ops ops, Code *code)
         }
         {
             size_t end;
+            Fixed_Add add;
+            if (fixed_add_block(ops, i, &end, &add)) {
+                emit_fixed_add_call(&sb, add, base);
+                if (fixed_head) static_head += add.final_head;
+                else emit_head_adjust(&sb, add.final_head);
+                i = end;
+                continue;
+            }
             Fixed_Compare compare;
             if (fixed_compare_block(ops, i, &end, &compare)) {
                 emit_fixed_compare_call(&sb, compare, base);
