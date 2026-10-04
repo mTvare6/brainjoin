@@ -1990,16 +1990,12 @@ bool jit_compile(Ops ops, Code *code)
 
             case OP_OUTPUT: {
                 for (size_t i = 0; i < op.operand; ++i) {
-                    nob_sb_append_cstr(&sb, "\x57");                            // push rdi
-                    nob_da_append_many(&sb, "\x48\xc7\xc0\x01\x00\x00\x00", 7); // mov rax, 1
-                    if (fixed_head) {
-                        nob_sb_append_cstr(&sb, "\x48\x8d\xb7");                // lea rsi, [rdi+base]
-                        nob_da_append_many(&sb, &base, sizeof(base));
-                    } else nob_sb_append_cstr(&sb, "\x48\x89\xfe");            // mov rsi, rdi
-                    nob_da_append_many(&sb, "\x48\xc7\xc7\x01\x00\x00\x00", 7); // mov rdi, 1
-                    nob_da_append_many(&sb, "\x48\xc7\xc2\x01\x00\x00\x00", 7); // mov rdx, 1
-                    nob_sb_append_cstr(&sb, "\x0f\x05");                        // syscall
-                    nob_sb_append_cstr(&sb, "\x5f");                            // pop rdi
+                    nob_da_append(&sb, 0x57);                    // push rdi
+                    nob_da_append_many(&sb, "\x0f\xb6", 2);     // movzx edi, byte [cell]
+                    emit_modrm_rdi(&sb, 7, base);
+                    int (*helper)(int) = putchar;
+                    emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                    nob_da_append(&sb, 0x5f);                    // pop rdi
                 }
             } break;
 
