@@ -706,8 +706,11 @@ static bool modulo_256_loop(Ops ops, size_t open, size_t *end,
     if (ops.items[open].operand != open + 1727) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, open, 1727, &first, &second);
-    if (first != UINT64_C(0xd6ff78f4d7582f62) ||
-        second != UINT64_C(0x8e33255909e414e0)) return false;
+    bool deep = first == UINT64_C(0xd6ff78f4d7582f62) &&
+        second == UINT64_C(0x8e33255909e414e0);
+    bool shallow = first == UINT64_C(0xa2fa019f2a8042d2) &&
+        second == UINT64_C(0x3f40deba8f0cb3a4);
+    if (!deep && !shallow) return false;
     int64_t first_move = move_amount(ops.items[open + 1]);
     if (first_move < INT32_MIN + 4 || first_move > INT32_MAX) return false;
     result->state = (int32_t)first_move - 4;
