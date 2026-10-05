@@ -1193,6 +1193,35 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     for (size_t i = 0; i < count; ++i) base[affine->offsets[i]] = next[i];
 }
 
+#define DEFINE_AFFINE_EXEC(N) \
+    static void affine_exec_##N(uint8_t *base, const Affine *affine) \
+    { \
+        enum { count = (N), width = (N) + 1, cells = width * width }; \
+        uint8_t state[width], next[count]; \
+        for (size_t i = 0; i < count; ++i) \
+            state[i] = base[affine->offsets[i]]; \
+        state[count] = 1; \
+        uint8_t iterations = state[affine->control]; \
+        if (!iterations) return; \
+        if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations; \
+        const uint8_t *matrix = affine->plan->tables + \
+            (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells); \
+        for (size_t row = 0; row < count; ++row) { \
+            uint32_t sum = 0; \
+            for (size_t column = 0; column < width; ++column) \
+                sum += (uint32_t)matrix[row * width + column] * state[column]; \
+            next[row] = (uint8_t)sum; \
+        } \
+        for (size_t i = 0; i < count; ++i) \
+            base[affine->offsets[i]] = next[i]; \
+    }
+
+DEFINE_AFFINE_EXEC(3)
+DEFINE_AFFINE_EXEC(14)
+DEFINE_AFFINE_EXEC(28)
+DEFINE_AFFINE_EXEC(29)
+#undef DEFINE_AFFINE_EXEC
+
 static void fixed_multiply_exec(uint8_t *cells)
 {
     int32_t x, y;
@@ -1892,7 +1921,14 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
     nob_sb_append_cstr(sb, "\x48\xbe"); // movabs rsi, affine
     uintptr_t descriptor = (uintptr_t)affine;
     nob_da_append_many(sb, &descriptor, sizeof(descriptor));
-    void (*helper)(uint8_t *, const Affine *) = affine_exec;
+    void (*helper)(uint8_t *, const Affine *);
+    switch (affine->count) {
+        case 3: helper = affine_exec_3; break;
+        case 14: helper = affine_exec_14; break;
+        case 28: helper = affine_exec_28; break;
+        case 29: helper = affine_exec_29; break;
+        default: helper = affine_exec; break;
+    }
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
     nob_da_append(sb, 0x5f); // pop rdi
 }
