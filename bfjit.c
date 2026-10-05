@@ -1636,6 +1636,63 @@ static void emit_linear(Nob_String_Builder *sb, Deltas deltas, uint8_t source,
     emit_zero(sb, base);
 }
 
+static void emit_affine_term(Nob_String_Builder *sb, uint8_t factor,
+                             uint8_t source)
+{
+    if (!factor) return;
+    uint8_t source_modrm = source ? 0xca : 0xc2; // add edx, ecx/eax
+    if (factor == 1) {
+        nob_da_append(sb, 0x01);
+        nob_da_append(sb, source_modrm);
+    } else if (factor == 255) {
+        nob_da_append(sb, 0x29);
+        nob_da_append(sb, source_modrm);
+    } else {
+        nob_da_append(sb, 0x69);
+        nob_da_append(sb, (uint8_t)(source ? 0xf1 : 0xf0)); // imul esi, ecx/eax
+        uint32_t multiplier = factor;
+        nob_da_append_many(sb, &multiplier, sizeof(multiplier));
+        nob_da_append_many(sb, "\x01\xf2", 2); // add edx, esi
+    }
+}
+
+static bool emit_small_affine_if(Nob_String_Builder *sb, const Affine *affine,
+                                 int32_t base)
+{
+    if (affine->kind != AFFINE_IF || affine->count != 2) return false;
+    size_t width = 3;
+    const uint8_t *matrix = affine->plan->tables;
+    int64_t offsets[2] = {(int64_t)base + affine->offsets[0],
+                          (int64_t)base + affine->offsets[1]};
+    if (offsets[0] < INT32_MIN || offsets[0] > INT32_MAX ||
+        offsets[1] < INT32_MIN || offsets[1] > INT32_MAX) return false;
+    int32_t control = (int32_t)offsets[affine->control];
+    nob_da_append(sb, 0x80); // cmp byte [control], 0
+    emit_modrm_rdi(sb, 7, control);
+    nob_da_append(sb, 0);
+    nob_sb_append_cstr(sb, "\x0f\x84"); // jz done
+    size_t done_patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t body = sb->count;
+
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx eax, byte [cell 0]
+    emit_modrm_rdi(sb, 0, (int32_t)offsets[0]);
+    nob_da_append_many(sb, "\x0f\xb6", 2); // movzx ecx, byte [cell 1]
+    emit_modrm_rdi(sb, 1, (int32_t)offsets[1]);
+    for (size_t row = 0; row < 2; ++row) {
+        nob_da_append(sb, 0xba); // mov edx, constant
+        uint32_t constant = matrix[row * width + 2];
+        nob_da_append_many(sb, &constant, sizeof(constant));
+        emit_affine_term(sb, matrix[row * width], 0);
+        emit_affine_term(sb, matrix[row * width + 1], 1);
+        emit_store_byte(sb, 2, (int32_t)offsets[row]);
+    }
+    int32_t relative = (int32_t)(sb->count - body);
+    memcpy(&sb->items[done_patch], &relative, sizeof(relative));
+    return true;
+}
+
 static bool emit_simple_affine(Nob_String_Builder *sb, const Affine *affine,
                                int32_t base)
 {
@@ -2024,7 +2081,8 @@ bool jit_compile(Ops ops, Code *code)
             size_t close;
             Affine *affine = NULL;
             if (affine_loop(ops, i, &close, &affine, &plans)) {
-                if (emit_simple_affine(&sb, affine, base)) free(affine);
+                if (emit_small_affine_if(&sb, affine, base) ||
+                    emit_simple_affine(&sb, affine, base)) free(affine);
                 else emit_affine_call(&sb, affine, base);
                 if (clear_at(ops, close + 1)) close += 3;
                 i = close;
