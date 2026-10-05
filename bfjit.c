@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
 
@@ -339,6 +340,19 @@ static int64_t move_amount(Op op)
     if (op.kind == OP_RIGHT) return (int64_t)op.operand;
     if (op.kind == OP_LEFT) return -(int64_t)op.operand;
     return INT64_MIN;
+}
+
+static bool scan_loop(Ops ops, size_t open, size_t *close, int32_t *stride)
+{
+    if (open + 2 >= ops.count || ops.items[open].kind != OP_JUMP_IF_ZERO ||
+        ops.items[open].operand != open + 3 ||
+        ops.items[open + 2].kind != OP_JUMP_IF_NONZERO ||
+        ops.items[open + 2].operand != open + 1) return false;
+    int64_t move = move_amount(ops.items[open + 1]);
+    if (!move || move < INT32_MIN || move > INT32_MAX) return false;
+    *stride = (int32_t)move;
+    *close = open + 2;
+    return true;
 }
 
 static bool clear_at(Ops ops, size_t at)
@@ -1336,6 +1350,22 @@ static void emit_head_adjust(Nob_String_Builder *sb, int32_t amount)
     }
 }
 
+static void emit_scan(Nob_String_Builder *sb, int32_t stride)
+{
+    nob_da_append_many(sb, "\x80\x3f\x00\x74\x00", 5); // cmp [rdi],0; jz done
+    size_t done_patch = sb->count - 1;
+    size_t body = sb->count;
+    emit_head_adjust(sb, stride);
+    nob_da_append_many(sb, "\x80\x3f\x00\x75\x00", 5); // cmp [rdi],0; jnz body
+    size_t back_patch = sb->count - 1;
+    ptrdiff_t back = (ptrdiff_t)body - (ptrdiff_t)sb->count;
+    ptrdiff_t done = (ptrdiff_t)sb->count - (ptrdiff_t)(done_patch + 1);
+    assert(back >= INT8_MIN && back <= INT8_MAX);
+    assert(done >= INT8_MIN && done <= INT8_MAX);
+    sb->items[back_patch] = (uint8_t)back;
+    sb->items[done_patch] = (uint8_t)done;
+}
+
 static void emit_copy(Nob_String_Builder *sb, Copy copy, int32_t base)
 {
     nob_da_append_many(sb, "\x0f\xb6", 2);
@@ -1830,6 +1860,19 @@ bool jit_compile(Ops ops, Code *code)
                 else emit_head_adjust(&sb, increment.flag);
                 if (clear_at(ops, end + 1)) end += 3;
                 i = end;
+                continue;
+            }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO) {
+            size_t close;
+            int32_t stride;
+            if (scan_loop(ops, i, &close, &stride)) {
+                if (fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                }
+                emit_scan(&sb, stride);
+                i = close;
                 continue;
             }
         }
