@@ -1850,14 +1850,13 @@ bool jit_compile(Ops ops, Code *code)
     Affine_Plan *plans = NULL;
     for (size_t i = 0; i < ops.count; ++i) {
         Op op = ops.items[i];
-        int32_t base = fixed_head ? (int32_t)static_head : 0;
+        int32_t base = (int32_t)static_head;
         {
             size_t end;
             Increment_Carry increment;
             if (increment_carry(ops, i, &end, &increment)) {
                 emit_increment_carry(&sb, increment, base);
-                if (fixed_head) static_head += increment.flag;
-                else emit_head_adjust(&sb, increment.flag);
+                static_head += increment.flag;
                 if (clear_at(ops, end + 1)) end += 3;
                 i = end;
                 continue;
@@ -1867,10 +1866,8 @@ bool jit_compile(Ops ops, Code *code)
             size_t close;
             int32_t stride;
             if (scan_loop(ops, i, &close, &stride)) {
-                if (fixed_head) {
-                    emit_head_adjust(&sb, base);
-                    static_head = 0;
-                }
+                emit_head_adjust(&sb, base);
+                static_head = 0;
                 emit_scan(&sb, stride);
                 i = close;
                 continue;
@@ -1880,45 +1877,39 @@ bool jit_compile(Ops ops, Code *code)
             size_t end;
             if (fixed_integer_block(ops, i, &end)) {
                 emit_fixed_integer_call(&sb, base);
-                if (fixed_head) static_head -= 5;
-                else emit_head_adjust(&sb, -5);
+                static_head -= 5;
                 i = end;
                 continue;
             }
             if (fixed_divide_block(ops, i, &end)) {
                 emit_fixed_divide_call(&sb, base);
-                if (fixed_head) static_head -= 3;
-                else emit_head_adjust(&sb, -3);
+                static_head -= 3;
                 i = end;
                 continue;
             }
             Fixed_Add add;
             if (fixed_add_block(ops, i, &end, &add)) {
                 emit_fixed_add_call(&sb, add, base);
-                if (fixed_head) static_head += add.final_head;
-                else emit_head_adjust(&sb, add.final_head);
+                static_head += add.final_head;
                 i = end;
                 continue;
             }
             Fixed_Compare compare;
             if (fixed_compare_block(ops, i, &end, &compare)) {
                 emit_fixed_compare_call(&sb, compare, base);
-                if (fixed_head) static_head += compare.final_head;
-                else emit_head_adjust(&sb, compare.final_head);
+                static_head += compare.final_head;
                 i = end;
                 continue;
             }
             if (fixed_sqrt_block(ops, i, &end)) {
                 emit_fixed_sqrt_call(&sb, base);
-                if (fixed_head) static_head -= 12;
-                else emit_head_adjust(&sb, -12);
+                static_head -= 12;
                 i = end;
                 continue;
             }
             if (fixed_multiply_block(ops, i, &end)) {
                 emit_fixed_multiply_call(&sb, base);
-                if (fixed_head) static_head -= 7;
-                else emit_head_adjust(&sb, -7);
+                static_head -= 7;
                 i = end;
                 continue;
             }
@@ -1934,8 +1925,7 @@ bool jit_compile(Ops ops, Code *code)
             Subdigit subdigit;
             if (subdigit_block(ops, i, &end, &subdigit)) {
                 emit_subdigit(&sb, subdigit, base);
-                if (fixed_head) static_head += 2;
-                else emit_head_adjust(&sb, 2);
+                static_head += 2;
                 i = end;
                 continue;
             }
@@ -1968,8 +1958,7 @@ bool jit_compile(Ops ops, Code *code)
             Truth truth;
             if (truth_block(ops, i, &end, &truth)) {
                 emit_truth(&sb, truth, base);
-                if (fixed_head) static_head += truth.source;
-                else emit_head_adjust(&sb, truth.source);
+                static_head += truth.source;
                 i = end;
                 continue;
             }
@@ -1985,8 +1974,7 @@ bool jit_compile(Ops ops, Code *code)
             Copy copy;
             if (copy_block(ops, i, &end, &copy) || move_block(ops, i, &end, &copy)) {
                 emit_copy(&sb, copy, base);
-                if (fixed_head) static_head += copy.final_head;
-                else emit_head_adjust(&sb, copy.final_head);
+                static_head += copy.final_head;
                 if (clear_at(ops, end + 1)) end += 3;
                 i = end;
                 continue;
@@ -2060,23 +2048,11 @@ bool jit_compile(Ops ops, Code *code)
 
             // TODO: range checks for OP_LEFT and OP_RIGHT
             case OP_LEFT: {
-                if (fixed_head) {
-                    static_head -= op.operand;
-                } else {
-                    nob_sb_append_cstr(&sb, "\x48\x81\xef"); // sub rdi,
-                    uint32_t operand = (uint32_t)op.operand;
-                    nob_da_append_many(&sb, &operand, sizeof(operand));
-                }
+                static_head -= op.operand;
             } break;
 
             case OP_RIGHT: {
-                if (fixed_head) {
-                    static_head += op.operand;
-                } else {
-                    nob_sb_append_cstr(&sb, "\x48\x81\xc7"); // add rdi,
-                    uint32_t operand = (uint32_t)op.operand;
-                    nob_da_append_many(&sb, &operand, sizeof(operand));
-                }
+                static_head += op.operand;
             } break;
 
             case OP_OUTPUT: {
@@ -2094,7 +2070,7 @@ bool jit_compile(Ops ops, Code *code)
                 for (size_t i = 0; i < op.operand; ++i) {
                     nob_sb_append_cstr(&sb, "\x57");                            // push rdi
                     nob_da_append_many(&sb, "\x48\xc7\xc0\x00\x00\x00\x00", 7); // mov rax, 0
-                    if (fixed_head) {
+                    if (base) {
                         nob_sb_append_cstr(&sb, "\x48\x8d\xb7");                // lea rsi, [rdi+base]
                         nob_da_append_many(&sb, &base, sizeof(base));
                     } else nob_sb_append_cstr(&sb, "\x48\x89\xfe");            // mov rsi, rdi
@@ -2106,6 +2082,11 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_JUMP_IF_ZERO: {
+                if (!fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                    base = 0;
+                }
                 nob_da_append(&sb, 0x80);                  // cmp byte [rdi+base], 0
                 emit_modrm_rdi(&sb, 7, base);
                 nob_da_append(&sb, 0);
@@ -2120,6 +2101,11 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_JUMP_IF_NONZERO: {
+                if (!fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                    base = 0;
+                }
                 nob_da_append(&sb, 0x80);                  // cmp byte [rdi+base], 0
                 emit_modrm_rdi(&sb, 7, base);
                 nob_da_append(&sb, 0);
@@ -2136,6 +2122,10 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_FORK: {
+                if (!fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                }
                 nob_sb_append_cstr(&sb, "\x57");                    // save parent head
                 nob_da_append_many(&sb, "\x48\x8d\x7f\x01", 4);    // child head = parent + 1
                 nob_sb_append_cstr(&sb, "\x48\x8d\x35");            // child entry
@@ -2154,6 +2144,10 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_CHILD_END: {
+                if (!fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                }
                 nob_sb_append_cstr(&sb, "\x57\xbf");                // save head; site
                 uint32_t site = op.operand;
                 nob_da_append_many(&sb, &site, sizeof(site));
@@ -2163,6 +2157,10 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_JOIN: {
+                if (!fixed_head) {
+                    emit_head_adjust(&sb, base);
+                    static_head = 0;
+                }
                 nob_sb_append_cstr(&sb, "\x57\xbf");                // save head; site
                 uint32_t site = op.operand;
                 nob_da_append_many(&sb, &site, sizeof(site));
