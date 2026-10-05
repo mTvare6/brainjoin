@@ -2420,7 +2420,7 @@ int main(int argc, char **argv)
         assert(memory != NULL);
         Thread root = {.stop_at = UINT32_MAX};
         thread = &root;
-        code.run(memory);
+        code.run((uint8_t *)memory + JIT_MEMORY_CAP / 2);
         while (root.joins) join_thread(root.joins->site);
     }
 
