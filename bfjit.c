@@ -760,6 +760,90 @@ static bool fixed_sqrt_block(Ops ops, size_t at, size_t *end)
 
 enum { COMPARE_LT, COMPARE_LE, COMPARE_GT, COMPARE_GE, COMPARE_EQ };
 
+static bool carry_loop(Ops ops, size_t open, size_t *close, Carry *result);
+
+static bool take_semantic_move(Ops ops, size_t *at, int64_t *head,
+                               int64_t destination, int64_t source)
+{
+    size_t end;
+    Copy copy;
+    if (*head != destination || !move_block(ops, *at, &end, &copy) ||
+        !copy.destructive || *head + copy.source != source) return false;
+    *head += copy.final_head;
+    *at = end + 1;
+    return true;
+}
+
+static bool take_semantic_head(Ops ops, size_t *at, int64_t *head,
+                               int64_t amount)
+{
+    if (*at >= ops.count || move_amount(ops.items[*at]) != amount) return false;
+    *head += amount;
+    *at += 1;
+    return true;
+}
+
+static bool take_semantic_clear(Ops ops, size_t *at, int64_t head,
+                                int64_t expected)
+{
+    if (head != expected || !clear_at(ops, *at)) return false;
+    *at += 3;
+    return true;
+}
+
+static bool take_semantic_carry(Ops ops, size_t *at, int64_t head,
+                                int64_t control, int64_t low,
+                                int64_t scratch, int64_t flag, int64_t high)
+{
+    size_t end;
+    Carry carry;
+    if (head != control || !carry_loop(ops, *at, &end, &carry) ||
+        head + carry.low != low || head + carry.scratch != scratch ||
+        head + carry.flag != flag || head + carry.high != high) return false;
+    *at = end + 1;
+    return true;
+}
+
+static bool semantic_fixed_add_block(Ops ops, size_t at, size_t *end,
+                                     Fixed_Add *result)
+{
+    size_t cursor = at;
+    int64_t head = 0;
+    for (int64_t byte = 0; byte < 4; ++byte) {
+        if (!take_semantic_move(ops, &cursor, &head, byte, byte + 4)) return false;
+        if (byte != 3 && !take_semantic_head(ops, &cursor, &head, -3)) return false;
+    }
+    if (!take_semantic_head(ops, &cursor, &head, 7) ||
+        !take_semantic_clear(ops, &cursor, head, 14) ||
+        !take_semantic_head(ops, &cursor, &head, 1) ||
+        !take_semantic_clear(ops, &cursor, head, 15) ||
+        !take_semantic_clear(ops, &cursor, head, 15) ||
+        !take_semantic_head(ops, &cursor, &head, -7) ||
+        !take_semantic_carry(ops, &cursor, head, 8, 0, 12, 13, 15) ||
+        !take_semantic_head(ops, &cursor, &head, 6) ||
+        !take_semantic_clear(ops, &cursor, head, 14) ||
+        !take_semantic_head(ops, &cursor, &head, 1) ||
+        !take_semantic_carry(ops, &cursor, head, 15, 1, 12, 13, 14) ||
+        !take_semantic_head(ops, &cursor, &head, -6) ||
+        !take_semantic_carry(ops, &cursor, head, 9, 1, 12, 13, 14) ||
+        !take_semantic_head(ops, &cursor, &head, 6) ||
+        !take_semantic_clear(ops, &cursor, head, 15) ||
+        !take_semantic_head(ops, &cursor, &head, -1) ||
+        !take_semantic_carry(ops, &cursor, head, 14, 2, 12, 13, 15) ||
+        !take_semantic_head(ops, &cursor, &head, -4) ||
+        !take_semantic_carry(ops, &cursor, head, 10, 2, 12, 13, 15) ||
+        !take_semantic_head(ops, &cursor, &head, 4) ||
+        !take_semantic_clear(ops, &cursor, head, 14) ||
+        !take_semantic_head(ops, &cursor, &head, 1) ||
+        !take_semantic_carry(ops, &cursor, head, 15, 3, 12, 13, 14) ||
+        !take_semantic_head(ops, &cursor, &head, -4) ||
+        !take_semantic_carry(ops, &cursor, head, 11, 3, 12, 13, 14)) return false;
+    *result = (Fixed_Add){.destination = 0, .final_head = 11,
+                          .subtract = false};
+    *end = cursor - 1;
+    return true;
+}
+
 static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
                                 Fixed_Compare *result)
 {
@@ -794,21 +878,19 @@ static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
 static bool fixed_add_block(Ops ops, size_t at, size_t *end,
                             Fixed_Add *result)
 {
+    if (semantic_fixed_add_block(ops, at, end, result)) return true;
     if (!clear_at(ops, at) || at + 3 >= ops.count) return false;
-    bool looks_add = move_amount(ops.items[at + 3]) == 4;
     bool looks_subtract = add_amount(ops.items[at + 3]) == 255;
-    if (!looks_add && !looks_subtract) return false;
+    if (!looks_subtract) return false;
     struct Candidate {
         size_t count;
         uint64_t first, second;
         int32_t destination, final_head;
         bool subtract;
     } candidates[] = {
-        {353, UINT64_C(0xf3c83dc1b9e02a47), UINT64_C(0x48483591c05460cb), 0, 11, false},
         {569, UINT64_C(0x39d43b63bb5b3f95), UINT64_C(0xcba16d5ca6083b39), -12, -1, true},
     };
     for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
-        if (candidates[candidate].subtract != looks_subtract) continue;
         size_t count = candidates[candidate].count;
         if (at + count > ops.count) continue;
         uint64_t first, second;
@@ -1289,16 +1371,6 @@ static void fixed_compare_exec(uint8_t *cells, uint32_t comparison)
     memset(cells + 12, 0, 14);
 }
 
-static void fixed_add_exec(uint8_t *cells, uint32_t subtract)
-{
-    uint32_t x, y;
-    memcpy(&x, cells + 4, sizeof(x));
-    memcpy(&y, cells + 8, sizeof(y));
-    uint32_t result = subtract ? x - y : x + y;
-    memcpy(cells, &result, sizeof(result));
-    memset(cells + 4, 0, 12);
-}
-
 static void fixed_divide_exec(uint8_t *cells)
 {
     int32_t x, y;
@@ -1351,6 +1423,14 @@ static void emit_zero(Nob_String_Builder *sb, int32_t offset)
     nob_da_append(sb, 0xc6);
     emit_modrm_rdi(sb, 0, offset);
     nob_da_append(sb, 0);
+}
+
+static void emit_zero_dword(Nob_String_Builder *sb, int32_t offset)
+{
+    nob_da_append(sb, 0xc7);
+    emit_modrm_rdi(sb, 0, offset);
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
 }
 
 static void emit_add_byte(Nob_String_Builder *sb, bool subtract,
@@ -1869,18 +1949,16 @@ static void emit_fixed_compare_call(Nob_String_Builder *sb,
 static void emit_fixed_add_call(Nob_String_Builder *sb, Fixed_Add add,
                                 int32_t base)
 {
-    nob_da_append(sb, 0x57); // push rdi
     int32_t destination = base + add.destination;
-    if (destination) {
-        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
-        nob_da_append_many(sb, &destination, sizeof(destination));
-    }
-    nob_da_append(sb, 0xbe); // mov esi, subtract
-    uint32_t subtract = add.subtract;
-    nob_da_append_many(sb, &subtract, sizeof(subtract));
-    void (*helper)(uint8_t *, uint32_t) = fixed_add_exec;
-    emit_call(sb, fnaddr(&helper, sizeof(helper)));
-    nob_da_append(sb, 0x5f); // pop rdi
+    nob_da_append(sb, 0x8b); // mov eax, dword [x]
+    emit_modrm_rdi(sb, 0, destination + 4);
+    nob_da_append(sb, add.subtract ? 0x2b : 0x03); // sub/add eax, dword [y]
+    emit_modrm_rdi(sb, 0, destination + 8);
+    nob_da_append(sb, 0x89); // mov dword [result], eax
+    emit_modrm_rdi(sb, 0, destination);
+    emit_zero_dword(sb, destination + 4);
+    emit_zero_dword(sb, destination + 8);
+    emit_zero_dword(sb, destination + 12);
 }
 
 static void emit_fixed_divide_call(Nob_String_Builder *sb, int32_t base)
