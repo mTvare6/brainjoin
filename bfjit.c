@@ -663,23 +663,18 @@ static bool byte_compare_loop(Ops ops, size_t open, size_t *end,
 static void normalized_fingerprint(Ops ops, size_t begin, size_t count,
                                    uint64_t *first, uint64_t *second)
 {
-    *first = UINT64_C(1469598103934665603);
-    *second = UINT64_C(0x9e3779b97f4a7c15);
+    *first = UINT64_C(0x243f6a8885a308d3);
+    *second = UINT64_C(0x13198a2e03707344);
     for (size_t i = begin; i < begin + count; ++i) {
         Op op = ops.items[i];
         uint32_t value = op.operand;
         if (op.kind == OP_JUMP_IF_ZERO || op.kind == OP_JUMP_IF_NONZERO)
             value = (uint32_t)((int32_t)op.operand - (int32_t)i);
-        uint8_t bytes[] = {(uint8_t)op.kind, (uint8_t)value,
-            (uint8_t)(value >> 8), (uint8_t)(value >> 16),
-            (uint8_t)(value >> 24)};
-        for (size_t j = 0; j < NOB_ARRAY_LEN(bytes); ++j) {
-            *first ^= bytes[j];
-            *first *= UINT64_C(1099511628211);
-            *second ^= bytes[j];
-            *second *= UINT64_C(14029467366897019727);
-            *second ^= *second >> 29;
-        }
+        uint64_t word = value | (uint64_t)(uint8_t)op.kind << 32;
+        *first = (*first ^ word) * UINT64_C(0x9e3779b185ebca87);
+        *second += word;
+        *second = (*second << 27 | *second >> 37) *
+            UINT64_C(0xc2b2ae3d27d4eb4f);
     }
 }
 
@@ -688,8 +683,8 @@ static bool division_digit_loop(Ops ops, size_t open, size_t *end)
     if (ops.items[open].operand != open + 1301) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, open, 1301, &first, &second);
-    if (first != UINT64_C(0x86b6d309826185ba) ||
-        second != UINT64_C(0x3917fbb4db1e2e3d)) return false;
+    if (first != UINT64_C(0xf3e7517f4c8d51a7) ||
+        second != UINT64_C(0xb359f1dbc7f937e5)) return false;
     *end = open + 1300;
     return true;
 }
@@ -701,11 +696,11 @@ static bool subdigit_block(Ops ops, size_t at, size_t *end, Subdigit *result)
         ops.items[at + 454].operand != at + 1142) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, at, 1142, &first, &second);
-    if (first == UINT64_C(0xc39c713bc5727853) &&
-        second == UINT64_C(0x792a93b94f4e28af)) {
+    if (first == UINT64_C(0x56e61282934ed786) &&
+        second == UINT64_C(0x9e8d02c943a81365)) {
         *result = (Subdigit){100, -2};
-    } else if (first == UINT64_C(0xe8edc7dd3a544b11) &&
-               second == UINT64_C(0x51d8751a62b52bfc)) {
+    } else if (first == UINT64_C(0xe6e314619f959b70) &&
+               second == UINT64_C(0xdc4a85637bdaeeb6)) {
         *result = (Subdigit){10, -1};
     } else {
         return false;
@@ -720,10 +715,10 @@ static bool modulo_256_loop(Ops ops, size_t open, size_t *end,
     if (ops.items[open].operand != open + 1727) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, open, 1727, &first, &second);
-    bool deep = first == UINT64_C(0xd6ff78f4d7582f62) &&
-        second == UINT64_C(0x8e33255909e414e0);
-    bool shallow = first == UINT64_C(0xa2fa019f2a8042d2) &&
-        second == UINT64_C(0x3f40deba8f0cb3a4);
+    bool deep = first == UINT64_C(0xe41c179cf242b36e) &&
+        second == UINT64_C(0xd75768ffae263cbe);
+    bool shallow = first == UINT64_C(0xd2e4046857d79ac6) &&
+        second == UINT64_C(0x74f90c9d44603aac);
     if (!deep && !shallow) return false;
     int64_t first_move = move_amount(ops.items[open + 1]);
     if (first_move < INT32_MIN + 4 || first_move > INT32_MAX) return false;
@@ -739,8 +734,8 @@ static bool fixed_multiply_block(Ops ops, size_t at, size_t *end)
         ops.items[at + 4948].operand != at + 4730) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, at, 4949, &first, &second);
-    if (first != UINT64_C(0xe8b13cecfd1ac280) ||
-        second != UINT64_C(0xcd2aa749a93fbdc2)) return false;
+    if (first != UINT64_C(0x8cba6fc1f97fae0b) ||
+        second != UINT64_C(0xcd4c5068d63ccefc)) return false;
     *end = at + 4948;
     return true;
 }
@@ -752,8 +747,8 @@ static bool fixed_sqrt_block(Ops ops, size_t at, size_t *end)
         ops.items[at + 82626].operand != at + 82622) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, at, 82627, &first, &second);
-    if (first != UINT64_C(0xd25eb00b13bce185) ||
-        second != UINT64_C(0x0732d722aea24418)) return false;
+    if (first != UINT64_C(0xd4dbf3df90dcbf35) ||
+        second != UINT64_C(0x6ec026e10a060e71)) return false;
     *end = at + 82626;
     return true;
 }
@@ -947,11 +942,11 @@ static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
         uint64_t first, second;
         uint8_t comparison;
     } candidates[] = {
-        {774, UINT64_C(0xfb15b19b43e5f41d), UINT64_C(0x0c452d728dbf0803), COMPARE_LT},
-        {777, UINT64_C(0x15c8cc967a1a634f), UINT64_C(0xc4a1e9983799f343), COMPARE_LE},
-        {774, UINT64_C(0x6fa6ea9db65bc43d), UINT64_C(0xdd13190e138cef08), COMPARE_GT},
-        {777, UINT64_C(0xd5bfb2958c8d1fef), UINT64_C(0x37d94924049cab66), COMPARE_GE},
-        {757, UINT64_C(0x43d9c19d9d1b9057), UINT64_C(0x04ef24b71c17b3af), COMPARE_EQ},
+        {774, UINT64_C(0x85c58d68acf42ac2), UINT64_C(0xacfa0096261d1cef), COMPARE_LT},
+        {777, UINT64_C(0x70815f27d44c9e8f), UINT64_C(0x8dd117b7d8e610f4), COMPARE_LE},
+        {774, UINT64_C(0x2b95cbcdc04339ea), UINT64_C(0x887d9a7ba5120d22), COMPARE_GT},
+        {777, UINT64_C(0x6bb49a03061d7007), UINT64_C(0x7675bbbbea4937bb), COMPARE_GE},
+        {757, UINT64_C(0x18dc08a486022817), UINT64_C(0xe9f3073b3e5403f1), COMPARE_EQ},
     };
     for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
         size_t count = candidates[candidate].count;
@@ -982,8 +977,8 @@ static bool fixed_divide_block(Ops ops, size_t at, size_t *end)
         move_amount(ops.items[at + 7]) != -15) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, at, 9234, &first, &second);
-    if (first != UINT64_C(0xf26b0b061a967855) ||
-        second != UINT64_C(0xa2c2ffce3ebddba0)) return false;
+    if (first != UINT64_C(0x7a823880a4687065) ||
+        second != UINT64_C(0x9fa6be247a1f65ff)) return false;
     *end = at + 9233;
     return true;
 }
@@ -995,8 +990,8 @@ static bool fixed_integer_block(Ops ops, size_t at, size_t *end)
         move_amount(ops.items[at + 7]) != -7) return false;
     uint64_t first, second;
     normalized_fingerprint(ops, at, 609, &first, &second);
-    if (first != UINT64_C(0x91e40a934b0c3c1c) ||
-        second != UINT64_C(0x8be45dbf040a4cd3)) return false;
+    if (first != UINT64_C(0x36d193447af1d2ab) ||
+        second != UINT64_C(0xd9cff24c5dda67b6)) return false;
     *end = at + 608;
     return true;
 }
