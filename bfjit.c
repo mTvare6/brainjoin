@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <emmintrin.h>
 
 #include <fcntl.h>
@@ -272,9 +273,11 @@ enum { AFFINE_DOWN = 1, AFFINE_UP, AFFINE_IF };
 typedef struct Affine_Plan {
     struct Affine_Plan *next;
     uint32_t count, kind;
-    bool built;
+    atomic_bool built;
     uint8_t tables[];
 } Affine_Plan;
+
+static pthread_mutex_t affine_plan_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     uint32_t count, kind, control;
@@ -1147,10 +1150,10 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
     plan->tables[table_count * cells] = 0;
     if (kind == AFFINE_IF) {
         memcpy(plan->tables, matrix, cells);
-        plan->built = true;
+        atomic_init(&plan->built, true);
     } else {
         memcpy(plan->tables + cells, matrix, cells);
-        plan->built = false;
+        atomic_init(&plan->built, false);
     }
     *plans = plan;
     return plan;
@@ -1158,14 +1161,18 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
 
 static void build_affine_plan(Affine_Plan *plan)
 {
-    if (plan->built) return;
-    size_t width = (size_t)plan->count + 1, cells = width * width;
-    memset(plan->tables, 0, cells);
-    for (size_t i = 0; i < width; ++i) plan->tables[i * width + i] = 1;
-    for (size_t i = 2; i < 256; ++i)
-        matrix_multiply(plan->tables + i * cells, plan->tables + cells,
-                        plan->tables + (i - 1) * cells, width);
-    plan->built = true;
+    if (atomic_load_explicit(&plan->built, memory_order_acquire)) return;
+    if (pthread_mutex_lock(&affine_plan_mutex) != 0) abort();
+    if (!atomic_load_explicit(&plan->built, memory_order_relaxed)) {
+        size_t width = (size_t)plan->count + 1, cells = width * width;
+        memset(plan->tables, 0, cells);
+        for (size_t i = 0; i < width; ++i) plan->tables[i * width + i] = 1;
+        for (size_t i = 2; i < 256; ++i)
+            matrix_multiply(plan->tables + i * cells, plan->tables + cells,
+                            plan->tables + (i - 1) * cells, width);
+        atomic_store_explicit(&plan->built, true, memory_order_release);
+    }
+    if (pthread_mutex_unlock(&affine_plan_mutex) != 0) abort();
 }
 
 static bool affine_loop(Ops ops, size_t open, size_t *close, Affine **result,
@@ -1330,6 +1337,8 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     uint8_t iterations = state[affine->control];
     if (!iterations) return;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
+    if (affine->kind != AFFINE_IF && iterations != 1)
+        build_affine_plan((Affine_Plan *)affine->plan);
     const uint8_t *matrix = affine->plan->tables +
         (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
     for (size_t row = 0; row < count; ++row) {
@@ -1352,6 +1361,8 @@ static void affine_exec(uint8_t *base, const Affine *affine)
         uint8_t iterations = state[affine->control]; \
         if (!iterations) return; \
         if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations; \
+        if (affine->kind != AFFINE_IF && iterations != 1) \
+            build_affine_plan((Affine_Plan *)affine->plan); \
         const uint8_t *matrix = affine->plan->tables + \
             (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells); \
         for (size_t row = 0; row < count; ++row) { \
@@ -1379,6 +1390,8 @@ static void affine_exec_14(uint8_t *base, const Affine *affine)
     uint8_t iterations = state[affine->control];
     if (!iterations) return;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
+    if (affine->kind != AFFINE_IF && iterations != 1)
+        build_affine_plan((Affine_Plan *)affine->plan);
     const uint8_t *matrix = affine->plan->tables +
         (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
     __m128i zero = _mm_setzero_si128();
@@ -2069,7 +2082,6 @@ static void emit_fixed_integer_call(Nob_String_Builder *sb, int32_t base)
 static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
                              int32_t base)
 {
-    build_affine_plan((Affine_Plan *)affine->plan);
     nob_da_append(sb, 0x57); // push rdi
     if (base) {
         nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
