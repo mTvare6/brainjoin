@@ -1395,24 +1395,21 @@ static void fixed_sqrt_exec(uint8_t *cells)
     uint32_t input;
     memcpy(&input, cells + 4, sizeof(input));
     uint64_t radicand = (uint64_t)input << 16;
-    uint32_t remainder = 0, root = 0, trial = 0;
-    bool subtracted = false;
-    for (size_t pair = 0; pair < 24; ++pair) {
-        remainder = (remainder << 2) | (uint32_t)((radicand >> 46) & 3);
-        radicand <<= 2;
-        root <<= 1;
-        trial = (root << 1) + 1;
-        subtracted = remainder >= trial;
-        if (subtracted) {
-            remainder -= trial;
-            root += 1;
-        }
+    uint32_t root = (uint32_t)__builtin_sqrt((double)radicand);
+    uint64_t square = (uint64_t)root * root;
+    if (square > radicand) {
+        root -= 1;
+        square = (uint64_t)root * root;
+    } else if ((uint64_t)(root + 1) * (root + 1) <= radicand) {
+        root += 1;
+        square = (uint64_t)root * root;
     }
+    uint32_t remainder = (uint32_t)(radicand - square);
+    uint32_t trial = root & 1 ? 0 : (root << 1) + 1;
     memcpy(cells, &root, sizeof(root));
     memset(cells + 4, 0, 4);
     memcpy(cells + 8, &remainder, sizeof(remainder));
     memset(cells + 12, 0, 4);
-    if (subtracted) trial = 0;
     memcpy(cells + 16, &trial, sizeof(trial));
     memset(cells + 20, 0, 8);
 }
