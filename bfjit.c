@@ -1368,7 +1368,7 @@ DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
 
-static void fixed_multiply_exec(uint8_t *cells)
+static uint8_t *fixed_multiply_exec(uint8_t *head, uint8_t *cells)
 {
     int32_t x, y;
     memcpy(&x, cells + 4, sizeof(x));
@@ -1383,6 +1383,7 @@ static void fixed_multiply_exec(uint8_t *cells)
     memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
     memcpy(cells + 12, &product, sizeof(product));
     memset(cells + 20, 0, 8);
+    return head;
 }
 
 static void fixed_sqrt_exec(uint8_t *cells)
@@ -1966,15 +1967,14 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
 
 static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base)
 {
-    nob_da_append(sb, 0x57); // push rdi
     int32_t destination = base - 27;
     if (destination) {
-        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_sb_append_cstr(sb, "\x48\x8d\xb7"); // lea rsi, [rdi+destination]
         nob_da_append_many(sb, &destination, sizeof(destination));
-    }
-    void (*helper)(uint8_t *) = fixed_multiply_exec;
+    } else nob_sb_append_cstr(sb, "\x48\x89\xfe"); // mov rsi, rdi
+    uint8_t *(*helper)(uint8_t *, uint8_t *) = fixed_multiply_exec;
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
-    nob_da_append(sb, 0x5f); // pop rdi
+    nob_da_append_many(sb, "\x48\x89\xc7", 3); // mov rdi, rax
 }
 
 static void emit_fixed_sqrt_call(Nob_String_Builder *sb, int32_t base)
