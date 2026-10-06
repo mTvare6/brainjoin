@@ -761,6 +761,10 @@ static bool fixed_sqrt_block(Ops ops, size_t at, size_t *end)
 enum { COMPARE_LT, COMPARE_LE, COMPARE_GT, COMPARE_GE, COMPARE_EQ };
 
 static bool carry_loop(Ops ops, size_t open, size_t *close, Carry *result);
+static bool complement_block(Ops ops, size_t at, size_t *end,
+                             Complement *result);
+static bool linear_loop(Ops ops, size_t open, size_t *close, Deltas *deltas,
+                        uint8_t *source);
 
 static bool take_semantic_move(Ops ops, size_t *at, int64_t *head,
                                int64_t destination, int64_t source)
@@ -844,6 +848,95 @@ static bool semantic_fixed_add_block(Ops ops, size_t at, size_t *end,
     return true;
 }
 
+static bool take_semantic_complement(Ops ops, size_t *at, int64_t head,
+                                     int64_t target)
+{
+    size_t end;
+    Complement complement;
+    if (!complement_block(ops, *at, &end, &complement) ||
+        head + complement.target != target) return false;
+    *at = end + 1;
+    return true;
+}
+
+static bool take_semantic_increment(Ops ops, size_t *at, int64_t *head,
+                                    int64_t scratch, int64_t flag,
+                                    int64_t carry)
+{
+    size_t end;
+    Increment_Carry increment;
+    if (!increment_carry(ops, *at, &end, &increment) ||
+        *head + increment.scratch != scratch ||
+        *head + increment.flag != flag ||
+        *head + increment.carry != carry) return false;
+    *head += increment.flag;
+    *at = end + 1;
+    return true;
+}
+
+static bool take_semantic_linear_move(Ops ops, size_t *at, int64_t head,
+                                      int64_t destination)
+{
+    size_t close;
+    uint8_t source;
+    Deltas deltas = {0};
+    if (!linear_loop(ops, *at, &close, &deltas, &source) || source != 255)
+        goto fail;
+    bool saw_source = false, saw_destination = false;
+    for (size_t i = 0; i < deltas.count; ++i) {
+        Delta delta = deltas.items[i];
+        if (!delta.offset && delta.delta == 255) saw_source = true;
+        else if (head + delta.offset == destination && delta.delta == 1)
+            saw_destination = true;
+        else if (delta.delta) goto fail;
+    }
+    if (!saw_source || !saw_destination) goto fail;
+    nob_da_free(deltas);
+    *at = close + 1;
+    return true;
+
+fail:
+    nob_da_free(deltas);
+    return false;
+}
+
+static bool semantic_fixed_subtract_block(Ops ops, size_t at, size_t *end,
+                                          Fixed_Add *result)
+{
+    size_t cursor = at;
+    int64_t head = 0;
+    for (int64_t byte = -4; byte < 0; ++byte)
+        if (!take_semantic_complement(ops, &cursor, head, byte)) return false;
+
+    if (!take_semantic_head(ops, &cursor, &head, 2) ||
+        !take_semantic_clear(ops, &cursor, head, 2) ||
+        !take_semantic_head(ops, &cursor, &head, 1) ||
+        !take_semantic_clear(ops, &cursor, head, 3) ||
+        !take_semantic_head(ops, &cursor, &head, -7) ||
+        !take_semantic_increment(ops, &cursor, &head, 0, 1, 2) ||
+        !take_semantic_head(ops, &cursor, &head, 2) ||
+        !take_semantic_clear(ops, &cursor, head, 3) ||
+        !take_semantic_head(ops, &cursor, &head, -1) ||
+        !take_semantic_carry(ops, &cursor, head, 2, -3, 0, 1, 3) ||
+        !take_semantic_clear(ops, &cursor, head, 2) ||
+        !take_semantic_head(ops, &cursor, &head, 1) ||
+        !take_semantic_carry(ops, &cursor, head, 3, -2, 0, 1, 2) ||
+        !take_semantic_clear(ops, &cursor, head, 3) ||
+        !take_semantic_head(ops, &cursor, &head, -1) ||
+        !take_semantic_linear_move(ops, &cursor, head, -1) ||
+        !take_semantic_head(ops, &cursor, &head, -14)) return false;
+
+    Fixed_Add add;
+    size_t add_end;
+    if (!semantic_fixed_add_block(ops, cursor, &add_end, &add) || add.subtract)
+        return false;
+    *result = (Fixed_Add){.destination = (int32_t)(head + add.destination),
+                          .final_head = (int32_t)(head + add.final_head),
+                          .subtract = true};
+    *end = add_end;
+    return true;
+}
+
 static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
                                 Fixed_Compare *result)
 {
@@ -878,32 +971,8 @@ static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
 static bool fixed_add_block(Ops ops, size_t at, size_t *end,
                             Fixed_Add *result)
 {
-    if (semantic_fixed_add_block(ops, at, end, result)) return true;
-    if (!clear_at(ops, at) || at + 3 >= ops.count) return false;
-    bool looks_subtract = add_amount(ops.items[at + 3]) == 255;
-    if (!looks_subtract) return false;
-    struct Candidate {
-        size_t count;
-        uint64_t first, second;
-        int32_t destination, final_head;
-        bool subtract;
-    } candidates[] = {
-        {569, UINT64_C(0x39d43b63bb5b3f95), UINT64_C(0xcba16d5ca6083b39), -12, -1, true},
-    };
-    for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
-        size_t count = candidates[candidate].count;
-        if (at + count > ops.count) continue;
-        uint64_t first, second;
-        normalized_fingerprint(ops, at, count, &first, &second);
-        if (first != candidates[candidate].first ||
-            second != candidates[candidate].second) continue;
-        *result = (Fixed_Add){candidates[candidate].destination,
-                              candidates[candidate].final_head,
-                              candidates[candidate].subtract};
-        *end = at + count - 1;
-        return true;
-    }
-    return false;
+    return semantic_fixed_add_block(ops, at, end, result) ||
+        semantic_fixed_subtract_block(ops, at, end, result);
 }
 
 static bool fixed_divide_block(Ops ops, size_t at, size_t *end)
