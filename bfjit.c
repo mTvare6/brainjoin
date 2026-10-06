@@ -1368,24 +1368,6 @@ DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
 
-static uint8_t *fixed_multiply_exec(uint8_t *head, uint8_t *cells)
-{
-    int32_t x, y;
-    memcpy(&x, cells + 4, sizeof(x));
-    memcpy(&y, cells + 8, sizeof(y));
-    uint32_t magnitude_x = x < 0 ? -(uint32_t)x : (uint32_t)x;
-    uint32_t magnitude_y = y < 0 ? -(uint32_t)y : (uint32_t)y;
-    uint64_t product = (uint64_t)magnitude_x * magnitude_y;
-    uint32_t result = (uint32_t)(product >> 16);
-    if ((x < 0) != (y < 0)) result = -result;
-    memcpy(cells, &result, sizeof(result));
-    memcpy(cells + 4, &magnitude_x, sizeof(magnitude_x));
-    memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
-    memcpy(cells + 12, &product, sizeof(product));
-    memset(cells + 20, 0, 8);
-    return head;
-}
-
 static void fixed_sqrt_exec(uint8_t *cells)
 {
     uint32_t input;
@@ -1965,16 +1947,18 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
     nob_sb_append_cstr(sb, "\xff\xd0");
 }
 
-static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base)
+static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base,
+                                     Addrs *calls)
 {
     int32_t destination = base - 27;
     if (destination) {
         nob_sb_append_cstr(sb, "\x48\x8d\xb7"); // lea rsi, [rdi+destination]
         nob_da_append_many(sb, &destination, sizeof(destination));
     } else nob_sb_append_cstr(sb, "\x48\x89\xfe"); // mov rsi, rdi
-    uint8_t *(*helper)(uint8_t *, uint8_t *) = fixed_multiply_exec;
-    emit_call(sb, fnaddr(&helper, sizeof(helper)));
-    nob_da_append_many(sb, "\x48\x89\xc7", 3); // mov rdi, rax
+    nob_da_append(sb, 0xe8); // call multiply stub
+    nob_da_append(calls, sb->count);
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
 }
 
 static void emit_fixed_sqrt_call(Nob_String_Builder *sb, int32_t base)
@@ -2077,6 +2061,7 @@ bool jit_compile(Ops ops, Code *code)
     bool result = true;
     Nob_String_Builder sb = {0};
     Loop_Patches loops = {0};
+    Addrs multiply_calls = {0};
     bool fixed_head = has_static_positions(ops);
     int64_t static_head = 0;
     Affine_Plan *plans = NULL;
@@ -2140,7 +2125,7 @@ bool jit_compile(Ops ops, Code *code)
                 continue;
             }
             if (fixed_multiply_block(ops, i, &end)) {
-                emit_fixed_multiply_call(&sb, base);
+                emit_fixed_multiply_call(&sb, base, &multiply_calls);
                 static_head -= 7;
                 i = end;
                 continue;
@@ -2409,6 +2394,40 @@ bool jit_compile(Ops ops, Code *code)
 
     nob_sb_append_cstr(&sb, "\xC3");
 
+    if (multiply_calls.count) {
+        size_t multiply_stub = sb.count;
+        static const uint8_t multiply_code[] = {
+            0x8b,0x46,0x04,                         // mov eax, [rsi+4]
+            0x44,0x8b,0x4e,0x08,                    // mov r9d, [rsi+8]
+            0x48,0xc7,0x46,0x14,0,0,0,0,            // mov qword [rsi+20], 0
+            0x89,0xc2,                               // mov edx, eax
+            0x44,0x89,0xc9,                          // mov ecx, r9d
+            0xf7,0xda,                               // neg edx
+            0x0f,0x48,0xd0,                          // cmovs edx, eax
+            0xf7,0xd9,                               // neg ecx
+            0x41,0x0f,0x48,0xc9,                     // cmovs ecx, r9d
+            0x89,0x56,0x04,                          // mov [rsi+4], edx
+            0x41,0x89,0xd2,                          // mov r10d, edx
+            0x89,0x4e,0x08,                          // mov [rsi+8], ecx
+            0x4c,0x0f,0xaf,0xd1,                     // imul r10, rcx
+            0x4c,0x89,0x56,0x0c,                     // mov [rsi+12], r10
+            0x49,0xc1,0xea,0x10,                     // shr r10, 16
+            0x45,0x89,0xd0,                          // mov r8d, r10d
+            0x45,0x89,0xc3,                          // mov r11d, r8d
+            0x41,0xf7,0xdb,                          // neg r11d
+            0x44,0x31,0xc8,                          // xor eax, r9d
+            0x45,0x0f,0x48,0xc3,                     // cmovs r8d, r11d
+            0x44,0x89,0x06,                          // mov [rsi], r8d
+            0xc3,                                    // ret
+        };
+        nob_da_append_many(&sb, multiply_code, sizeof(multiply_code));
+        for (size_t i = 0; i < multiply_calls.count; ++i) {
+            size_t operand = multiply_calls.items[i];
+            int32_t relative = (int32_t)(multiply_stub - (operand + 4));
+            memcpy(sb.items + operand, &relative, sizeof(relative));
+        }
+    }
+
     code->len = sb.count;
     code->run = mmap(NULL, sb.count, PROT_EXEC | PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code->run == MAP_FAILED) {
@@ -2426,6 +2445,7 @@ defer:
     }
     nob_da_free(sb);
     nob_da_free(loops);
+    nob_da_free(multiply_calls);
     return result;
 }
 
