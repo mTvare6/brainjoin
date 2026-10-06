@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <emmintrin.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1138,11 +1139,12 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
         if (!memcmp(body, matrix, cells)) return plan;
     }
     size_t table_count = kind == AFFINE_IF ? 1 : 256;
-    Affine_Plan *plan = malloc(sizeof(*plan) + table_count * cells);
+    Affine_Plan *plan = malloc(sizeof(*plan) + table_count * cells + 1);
     if (!plan) abort();
     plan->next = *plans;
     plan->count = count;
     plan->kind = kind;
+    plan->tables[table_count * cells] = 0;
     if (kind == AFFINE_IF) {
         memcpy(plan->tables, matrix, cells);
         plan->built = true;
@@ -1363,10 +1365,42 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     }
 
 DEFINE_AFFINE_EXEC(3)
-DEFINE_AFFINE_EXEC(14)
 DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
+
+static void affine_exec_14(uint8_t *base, const Affine *affine)
+{
+    enum { count = 14, width = 15, cells = width * width };
+    uint8_t state[16] = {0}, next[count];
+    for (size_t i = 0; i < count; ++i)
+        state[i] = base[affine->offsets[i]];
+    state[count] = 1;
+    uint8_t iterations = state[affine->control];
+    if (!iterations) return;
+    if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
+    const uint8_t *matrix = affine->plan->tables +
+        (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
+    __m128i zero = _mm_setzero_si128();
+    __m128i state_bytes = _mm_loadu_si128((const __m128i *)state);
+    __m128i state_low = _mm_unpacklo_epi8(state_bytes, zero);
+    __m128i state_high = _mm_unpackhi_epi8(state_bytes, zero);
+    for (size_t row = 0; row < count; ++row) {
+        __m128i coefficients = _mm_loadu_si128(
+            (const __m128i *)(matrix + row * width));
+        __m128i low = _mm_mullo_epi16(
+            _mm_unpacklo_epi8(coefficients, zero), state_low);
+        __m128i high = _mm_mullo_epi16(
+            _mm_unpackhi_epi8(coefficients, zero), state_high);
+        __m128i sum = _mm_add_epi16(low, high);
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 4));
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 2));
+        next[row] = (uint8_t)_mm_cvtsi128_si32(sum);
+    }
+    for (size_t i = 0; i < count; ++i)
+        base[affine->offsets[i]] = next[i];
+}
 
 static void fixed_sqrt_exec(uint8_t *cells)
 {
