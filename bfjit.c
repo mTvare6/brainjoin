@@ -2594,7 +2594,11 @@ bool generate_ops(const char *file_path, Ops *ops)
                 while (l.content.count - l.pos >= sizeof(repeated)) {
                     uint64_t word;
                     memcpy(&word, l.content.data + l.pos, sizeof(word));
-                    if (word != repeated) break;
+                    uint64_t difference = word ^ repeated;
+                    if (difference) {
+                        l.pos += (size_t)__builtin_ctzll(difference) / 8;
+                        break;
+                    }
                     l.pos += sizeof(word);
                 }
                 while (l.pos < l.content.count && l.content.data[l.pos] == c)
