@@ -1457,17 +1457,16 @@ static void affine_exec_29_avx2(uint8_t *base, const Affine *affine)
     for (size_t row = 0; row < count; ++row) {
         __m256i coefficients = _mm256_loadu_si256(
             (const __m256i *)(matrix + row * width));
-        __m256i products = _mm256_add_epi16(
-            _mm256_mullo_epi16(
+        __m256i products = _mm256_add_epi32(
+            _mm256_madd_epi16(
                 _mm256_unpacklo_epi8(coefficients, zero), state_low),
-            _mm256_mullo_epi16(
+            _mm256_madd_epi16(
                 _mm256_unpackhi_epi8(coefficients, zero), state_high));
-        __m128i sum = _mm_add_epi16(
+        __m128i sum = _mm_add_epi32(
             _mm256_castsi256_si128(products),
             _mm256_extracti128_si256(products, 1));
-        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
-        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 4));
-        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 2));
+        sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+        sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
         next[row] = (uint8_t)_mm_cvtsi128_si32(sum);
     }
     for (size_t i = 0; i < count; ++i)
