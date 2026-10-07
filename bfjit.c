@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <emmintrin.h>
+#include <immintrin.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1142,12 +1142,12 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
         if (!memcmp(body, matrix, cells)) return plan;
     }
     size_t table_count = kind == AFFINE_IF ? 1 : 256;
-    Affine_Plan *plan = malloc(sizeof(*plan) + table_count * cells + 1);
+    Affine_Plan *plan = malloc(sizeof(*plan) + table_count * cells + 16);
     if (!plan) abort();
     plan->next = *plans;
     plan->count = count;
     plan->kind = kind;
-    plan->tables[table_count * cells] = 0;
+    memset(plan->tables + table_count * cells, 0, 16);
     if (kind == AFFINE_IF) {
         memcpy(plan->tables, matrix, cells);
         atomic_init(&plan->built, true);
@@ -1406,6 +1406,45 @@ static void affine_exec_14(uint8_t *base, const Affine *affine)
         __m128i high = _mm_mullo_epi16(
             _mm_unpackhi_epi8(coefficients, zero), state_high);
         __m128i sum = _mm_add_epi16(low, high);
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 4));
+        sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 2));
+        next[row] = (uint8_t)_mm_cvtsi128_si32(sum);
+    }
+    for (size_t i = 0; i < count; ++i)
+        base[affine->offsets[i]] = next[i];
+}
+
+__attribute__((target("avx2")))
+static void affine_exec_29_avx2(uint8_t *base, const Affine *affine)
+{
+    enum { count = 29, width = 30, cells = width * width };
+    uint8_t state[32] = {0}, next[count];
+    for (size_t i = 0; i < count; ++i)
+        state[i] = base[affine->offsets[i]];
+    state[count] = 1;
+    uint8_t iterations = state[affine->control];
+    if (!iterations) return;
+    if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
+    if (affine->kind != AFFINE_IF && iterations != 1)
+        build_affine_plan((Affine_Plan *)affine->plan);
+    const uint8_t *matrix = affine->plan->tables +
+        (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
+    __m256i zero = _mm256_setzero_si256();
+    __m256i state_bytes = _mm256_loadu_si256((const __m256i *)state);
+    __m256i state_low = _mm256_unpacklo_epi8(state_bytes, zero);
+    __m256i state_high = _mm256_unpackhi_epi8(state_bytes, zero);
+    for (size_t row = 0; row < count; ++row) {
+        __m256i coefficients = _mm256_loadu_si256(
+            (const __m256i *)(matrix + row * width));
+        __m256i products = _mm256_add_epi16(
+            _mm256_mullo_epi16(
+                _mm256_unpacklo_epi8(coefficients, zero), state_low),
+            _mm256_mullo_epi16(
+                _mm256_unpackhi_epi8(coefficients, zero), state_high));
+        __m128i sum = _mm_add_epi16(
+            _mm256_castsi256_si128(products),
+            _mm256_extracti128_si256(products, 1));
         sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
         sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 4));
         sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 2));
@@ -2095,7 +2134,10 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
         case 3: helper = affine_exec_3; break;
         case 14: helper = affine_exec_14; break;
         case 28: helper = affine_exec_28; break;
-        case 29: helper = affine_exec_29; break;
+        case 29:
+            helper = __builtin_cpu_supports("avx2") ?
+                affine_exec_29_avx2 : affine_exec_29;
+            break;
         default: helper = affine_exec; break;
     }
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
