@@ -38,6 +38,7 @@ typedef struct {
     Op *items;
     size_t count;
     size_t capacity;
+    bool static_positions;
 } Ops;
 
 typedef struct {
@@ -1959,38 +1960,6 @@ static bool emit_simple_affine(Nob_String_Builder *sb, const Affine *affine,
     return true;
 }
 
-static bool has_static_positions(Ops ops)
-{
-    int64_t *loops = NULL;
-    size_t loop_count = 0, loop_capacity = 0;
-    int64_t head = 0;
-    for (size_t i = 0; i < ops.count; ++i) {
-        if (head < INT32_MIN || head > INT32_MAX) goto fail;
-        Op op = ops.items[i];
-        if (op.kind == OP_LEFT) head -= op.operand;
-        else if (op.kind == OP_RIGHT) head += op.operand;
-        else if (op.kind == OP_JUMP_IF_ZERO) {
-            if (loop_count >= loop_capacity) {
-                loop_capacity = loop_capacity ? loop_capacity * 2 : 256;
-                loops = realloc(loops, loop_capacity * sizeof(*loops));
-                if (!loops) abort();
-            }
-            loops[loop_count++] = head;
-        } else if (op.kind == OP_JUMP_IF_NONZERO) {
-            if (!loop_count || loops[--loop_count] != head) goto fail;
-        } else if (op.kind == OP_FORK || op.kind == OP_CHILD_END || op.kind == OP_JOIN) {
-            goto fail;
-        }
-    }
-    if (loop_count || head < INT32_MIN || head > INT32_MAX) goto fail;
-    free(loops);
-    return true;
-
-fail:
-    free(loops);
-    return false;
-}
-
 static uintptr_t fnaddr(const void *p, size_t n)
 {
     uintptr_t result = 0;
@@ -2125,7 +2094,7 @@ bool jit_compile(Ops ops, Code *code)
     Loop_Patches loops = {0};
     Addrs divide_calls = {0};
     Addrs multiply_calls = {0};
-    bool fixed_head = has_static_positions(ops);
+    bool fixed_head = ops.static_positions;
     int64_t static_head = 0;
     Affine_Plan *plans = NULL;
     for (size_t i = 0; i < ops.count; ++i) {
@@ -2540,6 +2509,8 @@ bool generate_ops(const char *file_path, Ops *ops)
     Addrs stack = {0};
     Forks forks = {0};
     uint32_t next_site = 0;
+    int64_t static_head = 0;
+    ops->static_positions = true;
     int fd = open(file_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         nob_log(NOB_ERROR, "Could not open %s: %s", file_path, strerror(errno));
@@ -2611,6 +2582,10 @@ bool generate_ops(const char *file_path, Ops *ops)
                     .operand = (uint32_t)count,
                 };
                 nob_da_append(ops, op);
+                if (op.kind == OP_LEFT) static_head -= op.operand;
+                else if (op.kind == OP_RIGHT) static_head += op.operand;
+                if (static_head < INT32_MIN || static_head > INT32_MAX)
+                    ops->static_positions = false;
                 c = s;
             } break;
 
@@ -2618,7 +2593,8 @@ bool generate_ops(const char *file_path, Ops *ops)
                 size_t addr = ops->count;
                 Op op = {
                     .kind = c,
-                    .operand = 0,
+                    .operand = ops->static_positions ?
+                        (uint32_t)(int32_t)static_head : 0,
                 };
                 nob_da_append(ops, op);
                 nob_da_append(&stack, addr);
@@ -2634,6 +2610,9 @@ bool generate_ops(const char *file_path, Ops *ops)
                 }
 
                 size_t addr = stack.items[--stack.count];
+                if (ops->static_positions &&
+                    (int32_t)ops->items[addr].operand != static_head)
+                    ops->static_positions = false;
                 Op op = {
                     .kind = c,
                     .operand = (uint32_t)(addr + 1),
@@ -2651,6 +2630,7 @@ bool generate_ops(const char *file_path, Ops *ops)
 
             case '(': {
                 uint32_t site = next_site++;
+                ops->static_positions = false;
                 nob_da_append(ops, ((Op){.kind = OP_FORK, .operand = site}));
                 nob_da_append(&forks, ((Fork){.site = site}));
                 c = lexer_next(&l);
