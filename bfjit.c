@@ -1459,15 +1459,10 @@ static void fixed_sqrt_exec(uint8_t *cells)
     uint32_t input;
     memcpy(&input, cells + 4, sizeof(input));
     uint64_t radicand = (uint64_t)input << 16;
+    // This 32-bit-aligned radicand is exact in binary64; its root is below
+    // 2^24, where sqrt rounding is far too small to cross an integer boundary.
     uint32_t root = (uint32_t)__builtin_sqrt((double)radicand);
     uint64_t square = (uint64_t)root * root;
-    if (square > radicand) {
-        root -= 1;
-        square = (uint64_t)root * root;
-    } else if ((uint64_t)(root + 1) * (root + 1) <= radicand) {
-        root += 1;
-        square = (uint64_t)root * root;
-    }
     uint32_t remainder = (uint32_t)(radicand - square);
     uint32_t trial = root & 1 ? 0 : (root << 1) + 1;
     memcpy(cells, &root, sizeof(root));
