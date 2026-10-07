@@ -1501,28 +1501,6 @@ static void fixed_compare_exec(uint8_t *cells, uint32_t comparison)
     memset(cells + 12, 0, 14);
 }
 
-static void fixed_divide_exec(uint8_t *cells)
-{
-    int32_t x, y;
-    memcpy(&x, cells + 4, sizeof(x));
-    memcpy(&y, cells + 8, sizeof(y));
-    uint32_t magnitude_x = x < 0 ? -(uint32_t)x : (uint32_t)x;
-    uint32_t magnitude_y = y < 0 ? -(uint32_t)y : (uint32_t)y;
-    uint64_t numerator = (uint64_t)magnitude_x << 16;
-    uint64_t quotient = 0, remainder = numerator & UINT64_C(0xffffffffff);
-    if (magnitude_y) {
-        quotient = numerator / magnitude_y;
-        remainder = numerator % magnitude_y;
-    }
-    uint32_t result = (uint32_t)quotient;
-    if ((x < 0) != (y < 0)) result = -result;
-    memcpy(cells, &result, sizeof(result));
-    memcpy(cells + 4, &magnitude_x, sizeof(magnitude_x));
-    memcpy(cells + 8, &magnitude_y, sizeof(magnitude_y));
-    memcpy(cells + 12, &remainder, 5);
-    memset(cells + 17, 0, 11);
-}
-
 static void fixed_integer_exec(uint8_t *cells)
 {
     int32_t input;
@@ -2092,17 +2070,18 @@ static void emit_fixed_add_call(Nob_String_Builder *sb, Fixed_Add add,
     emit_zero_dword(sb, destination + 12);
 }
 
-static void emit_fixed_divide_call(Nob_String_Builder *sb, int32_t base)
+static void emit_fixed_divide_call(Nob_String_Builder *sb, int32_t base,
+                                   Addrs *calls)
 {
-    nob_da_append(sb, 0x57); // push rdi
     int32_t destination = base - 20;
     if (destination) {
-        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_sb_append_cstr(sb, "\x48\x8d\xb7"); // lea rsi, [rdi+destination]
         nob_da_append_many(sb, &destination, sizeof(destination));
-    }
-    void (*helper)(uint8_t *) = fixed_divide_exec;
-    emit_call(sb, fnaddr(&helper, sizeof(helper)));
-    nob_da_append(sb, 0x5f); // pop rdi
+    } else nob_sb_append_cstr(sb, "\x48\x89\xfe"); // mov rsi, rdi
+    nob_da_append(sb, 0xe8); // call divide stub
+    nob_da_append(calls, sb->count);
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
 }
 
 static void emit_fixed_integer_call(Nob_String_Builder *sb, int32_t base)
@@ -2149,6 +2128,7 @@ bool jit_compile(Ops ops, Code *code)
     bool result = true;
     Nob_String_Builder sb = {0};
     Loop_Patches loops = {0};
+    Addrs divide_calls = {0};
     Addrs multiply_calls = {0};
     bool fixed_head = has_static_positions(ops);
     int64_t static_head = 0;
@@ -2187,7 +2167,7 @@ bool jit_compile(Ops ops, Code *code)
                 continue;
             }
             if (fixed_divide_block(ops, i, &end)) {
-                emit_fixed_divide_call(&sb, base);
+                emit_fixed_divide_call(&sb, base, &divide_calls);
                 static_head -= 3;
                 i = end;
                 continue;
@@ -2482,6 +2462,27 @@ bool jit_compile(Ops ops, Code *code)
 
     nob_sb_append_cstr(&sb, "\xC3");
 
+    if (divide_calls.count) {
+        size_t divide_stub = sb.count;
+        static const uint8_t divide_code[] = {
+            0x8b,0x46,0x04,0x8b,0x4e,0x08,0x41,0x89,0xc0,0x41,0x89,0xc9,
+            0x41,0x89,0xc2,0x41,0xf7,0xda,0x44,0x0f,0x48,0xd0,0x41,0x89,
+            0xcb,0x41,0xf7,0xdb,0x44,0x0f,0x48,0xd9,0x44,0x89,0xd0,0x48,
+            0xc1,0xe0,0x10,0x45,0x85,0xdb,0x74,0x07,0x31,0xd2,0x49,0xf7,
+            0xf3,0xeb,0x0d,0x48,0x89,0xc2,0x48,0xc1,0xe2,0x18,0x48,0xc1,
+            0xea,0x18,0x31,0xc0,0x89,0xc1,0xf7,0xd9,0x45,0x31,0xc8,0x0f,
+            0x48,0xc1,0x89,0x06,0x44,0x89,0x56,0x04,0x44,0x89,0x5e,0x08,
+            0x89,0x56,0x0c,0x48,0xc1,0xea,0x20,0x88,0x56,0x10,0x31,0xc9,
+            0x48,0x89,0x4e,0x11,0x48,0x89,0x4e,0x14,0xc3,
+        };
+        nob_da_append_many(&sb, divide_code, sizeof(divide_code));
+        for (size_t i = 0; i < divide_calls.count; ++i) {
+            size_t operand = divide_calls.items[i];
+            int32_t relative = (int32_t)(divide_stub - (operand + 4));
+            memcpy(sb.items + operand, &relative, sizeof(relative));
+        }
+    }
+
     if (multiply_calls.count) {
         size_t multiply_stub = sb.count;
         static const uint8_t multiply_code[] = {
@@ -2533,6 +2534,7 @@ defer:
     }
     nob_da_free(sb);
     nob_da_free(loops);
+    nob_da_free(divide_calls);
     nob_da_free(multiply_calls);
     return result;
 }
