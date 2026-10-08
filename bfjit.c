@@ -2336,16 +2336,14 @@ bool jit_compile(Ops ops, Code *code)
 
             case OP_INPUT: {
                 for (size_t i = 0; i < op.operand; ++i) {
-                    nob_sb_append_cstr(&sb, "\x57");                            // push rdi
-                    nob_da_append_many(&sb, "\x48\xc7\xc0\x00\x00\x00\x00", 7); // mov rax, 0
-                    if (base) {
-                        nob_sb_append_cstr(&sb, "\x48\x8d\xb7");                // lea rsi, [rdi+base]
-                        nob_da_append_many(&sb, &base, sizeof(base));
-                    } else nob_sb_append_cstr(&sb, "\x48\x89\xfe");            // mov rsi, rdi
-                    nob_da_append_many(&sb, "\x48\xc7\xc7\x00\x00\x00\x00", 7); // mov rdi, 0
-                    nob_da_append_many(&sb, "\x48\xc7\xc2\x01\x00\x00\x00", 7); // mov rdx, 1
-                    nob_sb_append_cstr(&sb, "\x0f\x05");                        // syscall
-                    nob_sb_append_cstr(&sb, "\x5f");                            // pop rdi
+                    nob_da_append(&sb, 0x57);                // push rdi
+                    int (*helper)(void) = fixed_head ? getchar_unlocked : getchar;
+                    emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                    nob_da_append(&sb, 0x5f);                // pop rdi
+                    nob_da_append_many(&sb, "\x83\xf8\xff\x74\x00", 5);
+                    size_t skip = sb.count - 1;
+                    emit_store_byte(&sb, 0, base);
+                    sb.items[skip] = (uint8_t)(sb.count - skip - 1);
                 }
             } break;
 
