@@ -2328,7 +2328,7 @@ bool jit_compile(Ops ops, Code *code)
                     nob_da_append(&sb, 0x57);                    // push rdi
                     nob_da_append_many(&sb, "\x0f\xb6", 2);     // movzx edi, byte [cell]
                     emit_modrm_rdi(&sb, 7, base);
-                    int (*helper)(int) = putchar;
+                    int (*helper)(int) = fixed_head ? putchar_unlocked : putchar;
                     emit_call(&sb, fnaddr(&helper, sizeof(helper)));
                     nob_da_append(&sb, 0x5f);                    // pop rdi
                 }
