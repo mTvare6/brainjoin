@@ -1396,6 +1396,7 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     }
 
 DEFINE_AFFINE_EXEC(3)
+DEFINE_AFFINE_EXEC(4)
 DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
@@ -2120,6 +2121,7 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
     void (*helper)(uint8_t *, const Affine *);
     switch (affine->count) {
         case 3: helper = affine_exec_3; break;
+        case 4: helper = affine_exec_4; break;
         case 14: helper = affine_exec_14; break;
         case 28: helper = affine_exec_28; break;
         case 29:
