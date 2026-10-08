@@ -1401,6 +1401,28 @@ DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
 
+static void affine_exec_4_down(uint8_t *base, const Affine *affine)
+{
+    enum { count = 4, width = 5, cells = width * width };
+    uint8_t iterations = base[affine->offsets[affine->control]];
+    uint8_t state[width], next[count];
+    for (size_t i = 0; i < count; ++i)
+        state[i] = base[affine->offsets[i]];
+    state[count] = 1;
+    if (iterations != 1 &&
+        !atomic_load_explicit(&affine->plan->built, memory_order_acquire))
+        build_affine_plan((Affine_Plan *)affine->plan);
+    const uint8_t *matrix = affine->plan->tables + (size_t)iterations * cells;
+    for (size_t row = 0; row < count; ++row) {
+        uint32_t sum = 0;
+        for (size_t column = 0; column < width; ++column)
+            sum += (uint32_t)matrix[row * width + column] * state[column];
+        next[row] = (uint8_t)sum;
+    }
+    for (size_t i = 0; i < count; ++i)
+        base[affine->offsets[i]] = next[i];
+}
+
 static void affine_exec_14(uint8_t *base, const Affine *affine)
 {
     enum { count = 14, width = 15, cells = width * width };
@@ -2128,7 +2150,8 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
     void (*helper)(uint8_t *, const Affine *);
     switch (affine->count) {
         case 3: helper = affine_exec_3; break;
-        case 4: helper = affine_exec_4; break;
+        case 4: helper = affine->kind == AFFINE_DOWN ?
+            affine_exec_4_down : affine_exec_4; break;
         case 14: helper = affine_exec_14; break;
         case 28: helper = affine_exec_28; break;
         case 29:
