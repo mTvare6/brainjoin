@@ -2585,12 +2585,14 @@ bool generate_ops(const char *file_path, Ops *ops)
                     uint64_t difference = word ^ repeated;
                     if (difference) {
                         l.pos += (size_t)__builtin_ctzll(difference) / 8;
-                        break;
+                        goto run_done;
                     }
                     l.pos += sizeof(word);
                 }
                 while (l.pos < l.content.count && l.content.data[l.pos] == c)
                     l.pos += 1;
+run_done:
+                ;
                 size_t count = l.pos - start + 1;
                 char s = lexer_next(&l);
                 if (count > INT32_MAX) {
