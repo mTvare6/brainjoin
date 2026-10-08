@@ -1352,7 +1352,6 @@ static void affine_exec(uint8_t *base, const Affine *affine)
 {
     size_t count = affine->count, width = count + 1, cells = width * width;
     uint8_t iterations = base[affine->offsets[affine->control]];
-    if (!iterations) return;
     uint8_t state[33], next[33];
     for (size_t i = 0; i < count; ++i) state[i] = base[affine->offsets[i]];
     state[count] = 1;
@@ -1375,7 +1374,6 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     { \
         enum { count = (N), width = (N) + 1, cells = width * width }; \
         uint8_t iterations = base[affine->offsets[affine->control]]; \
-        if (!iterations) return; \
         uint8_t state[width], next[count]; \
         for (size_t i = 0; i < count; ++i) \
             state[i] = base[affine->offsets[i]]; \
@@ -1405,7 +1403,6 @@ static void affine_exec_14(uint8_t *base, const Affine *affine)
 {
     enum { count = 14, width = 15, cells = width * width };
     uint8_t iterations = base[affine->offsets[affine->control]];
-    if (!iterations) return;
     uint8_t state[16] = {0}, next[count];
     for (size_t i = 0; i < count; ++i)
         state[i] = base[affine->offsets[i]];
@@ -1441,7 +1438,6 @@ static void affine_exec_29_avx2(uint8_t *base, const Affine *affine)
 {
     enum { count = 29, width = 30, cells = width * width };
     uint8_t iterations = base[affine->offsets[affine->control]];
-    if (!iterations) return;
     uint8_t state[32] = {0}, next[count];
     for (size_t i = 0; i < count; ++i)
         state[i] = base[affine->offsets[i]];
@@ -2115,6 +2111,13 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
         nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
         nob_da_append_many(sb, &base, sizeof(base));
     }
+    nob_da_append(sb, 0x80); // cmp byte [control], 0
+    emit_modrm_rdi(sb, 7, affine->offsets[affine->control]);
+    nob_da_append(sb, 0);
+    nob_sb_append_cstr(sb, "\x0f\x84"); // jz done
+    size_t done_patch = sb->count;
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
     nob_sb_append_cstr(sb, "\x48\xbe"); // movabs rsi, affine
     uintptr_t descriptor = (uintptr_t)affine;
     nob_da_append_many(sb, &descriptor, sizeof(descriptor));
@@ -2131,6 +2134,8 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
         default: helper = affine_exec; break;
     }
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    int32_t relative = (int32_t)(sb->count - (done_patch + 4));
+    memcpy(sb->items + done_patch, &relative, sizeof(relative));
     nob_da_append(sb, 0x5f); // pop rdi
 }
 
