@@ -1351,11 +1351,11 @@ static bool carry_loop(Ops ops, size_t open, size_t *close, Carry *result)
 static void affine_exec(uint8_t *base, const Affine *affine)
 {
     size_t count = affine->count, width = count + 1, cells = width * width;
+    uint8_t iterations = base[affine->offsets[affine->control]];
+    if (!iterations) return;
     uint8_t state[33], next[33];
     for (size_t i = 0; i < count; ++i) state[i] = base[affine->offsets[i]];
     state[count] = 1;
-    uint8_t iterations = state[affine->control];
-    if (!iterations) return;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
     if (affine->kind != AFFINE_IF && iterations != 1)
         build_affine_plan((Affine_Plan *)affine->plan);
@@ -1374,12 +1374,12 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     static void affine_exec_##N(uint8_t *base, const Affine *affine) \
     { \
         enum { count = (N), width = (N) + 1, cells = width * width }; \
+        uint8_t iterations = base[affine->offsets[affine->control]]; \
+        if (!iterations) return; \
         uint8_t state[width], next[count]; \
         for (size_t i = 0; i < count; ++i) \
             state[i] = base[affine->offsets[i]]; \
         state[count] = 1; \
-        uint8_t iterations = state[affine->control]; \
-        if (!iterations) return; \
         if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations; \
         if (affine->kind != AFFINE_IF && iterations != 1) \
             build_affine_plan((Affine_Plan *)affine->plan); \
@@ -1404,12 +1404,12 @@ DEFINE_AFFINE_EXEC(29)
 static void affine_exec_14(uint8_t *base, const Affine *affine)
 {
     enum { count = 14, width = 15, cells = width * width };
+    uint8_t iterations = base[affine->offsets[affine->control]];
+    if (!iterations) return;
     uint8_t state[16] = {0}, next[count];
     for (size_t i = 0; i < count; ++i)
         state[i] = base[affine->offsets[i]];
     state[count] = 1;
-    uint8_t iterations = state[affine->control];
-    if (!iterations) return;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
     if (affine->kind != AFFINE_IF && iterations != 1)
         build_affine_plan((Affine_Plan *)affine->plan);
@@ -1440,12 +1440,12 @@ __attribute__((target("avx2")))
 static void affine_exec_29_avx2(uint8_t *base, const Affine *affine)
 {
     enum { count = 29, width = 30, cells = width * width };
+    uint8_t iterations = base[affine->offsets[affine->control]];
+    if (!iterations) return;
     uint8_t state[32] = {0}, next[count];
     for (size_t i = 0; i < count; ++i)
         state[i] = base[affine->offsets[i]];
     state[count] = 1;
-    uint8_t iterations = state[affine->control];
-    if (!iterations) return;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
     if (affine->kind != AFFINE_IF && iterations != 1)
         build_affine_plan((Affine_Plan *)affine->plan);
