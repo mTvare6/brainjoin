@@ -1356,7 +1356,8 @@ static void affine_exec(uint8_t *base, const Affine *affine)
     for (size_t i = 0; i < count; ++i) state[i] = base[affine->offsets[i]];
     state[count] = 1;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
-    if (affine->kind != AFFINE_IF && iterations != 1)
+    if (affine->kind != AFFINE_IF && iterations != 1 &&
+        !atomic_load_explicit(&affine->plan->built, memory_order_acquire))
         build_affine_plan((Affine_Plan *)affine->plan);
     const uint8_t *matrix = affine->plan->tables +
         (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
@@ -1379,7 +1380,8 @@ static void affine_exec(uint8_t *base, const Affine *affine)
             state[i] = base[affine->offsets[i]]; \
         state[count] = 1; \
         if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations; \
-        if (affine->kind != AFFINE_IF && iterations != 1) \
+        if (affine->kind != AFFINE_IF && iterations != 1 && \
+            !atomic_load_explicit(&affine->plan->built, memory_order_acquire)) \
             build_affine_plan((Affine_Plan *)affine->plan); \
         const uint8_t *matrix = affine->plan->tables + \
             (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells); \
@@ -1408,7 +1410,8 @@ static void affine_exec_14(uint8_t *base, const Affine *affine)
         state[i] = base[affine->offsets[i]];
     state[count] = 1;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
-    if (affine->kind != AFFINE_IF && iterations != 1)
+    if (affine->kind != AFFINE_IF && iterations != 1 &&
+        !atomic_load_explicit(&affine->plan->built, memory_order_acquire))
         build_affine_plan((Affine_Plan *)affine->plan);
     const uint8_t *matrix = affine->plan->tables +
         (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
@@ -1443,7 +1446,8 @@ static void affine_exec_29_avx2(uint8_t *base, const Affine *affine)
         state[i] = base[affine->offsets[i]];
     state[count] = 1;
     if (affine->kind == AFFINE_UP) iterations = (uint8_t)-iterations;
-    if (affine->kind != AFFINE_IF && iterations != 1)
+    if (affine->kind != AFFINE_IF && iterations != 1 &&
+        !atomic_load_explicit(&affine->plan->built, memory_order_acquire))
         build_affine_plan((Affine_Plan *)affine->plan);
     const uint8_t *matrix = affine->plan->tables +
         (affine->kind == AFFINE_IF ? 0 : (size_t)iterations * cells);
