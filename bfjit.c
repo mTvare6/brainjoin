@@ -1543,6 +1543,17 @@ static void input_repeat_locked(uint8_t *cell, uint32_t count)
     }
 }
 
+static void output_repeat(uint8_t value, uint32_t count)
+{
+    uint8_t buffer[256];
+    memset(buffer, value, sizeof(buffer));
+    while (count >= sizeof(buffer)) {
+        fwrite(buffer, sizeof(buffer), 1, stdout);
+        count -= sizeof(buffer);
+    }
+    if (count) fwrite(buffer, count, 1, stdout);
+}
+
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
 {
     if (!offset) {
@@ -2340,6 +2351,17 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_OUTPUT: {
+                if (fixed_head && op.operand >= 8) {
+                    nob_da_append(&sb, 0x57);                // push rdi
+                    nob_da_append_many(&sb, "\x0f\xb6", 2); // movzx edi, byte [cell]
+                    emit_modrm_rdi(&sb, 7, base);
+                    nob_da_append(&sb, 0xbe);                // mov esi, count
+                    nob_da_append_many(&sb, &op.operand, sizeof(op.operand));
+                    void (*helper)(uint8_t, uint32_t) = output_repeat;
+                    emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                    nob_da_append(&sb, 0x5f);                // pop rdi
+                    break;
+                }
                 for (size_t i = 0; i < op.operand; ++i) {
                     nob_da_append(&sb, 0x57);                    // push rdi
                     nob_da_append_many(&sb, "\x0f\xb6", 2);     // movzx edi, byte [cell]
