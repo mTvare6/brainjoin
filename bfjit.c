@@ -1527,6 +1527,22 @@ static void fixed_integer_exec(uint8_t *cells)
     memset(cells + 12, 0, 8);
 }
 
+static void input_repeat(uint8_t *cell, uint32_t count)
+{
+    while (count--) {
+        int c = getchar_unlocked();
+        if (c != EOF) *cell = (uint8_t)c;
+    }
+}
+
+static void input_repeat_locked(uint8_t *cell, uint32_t count)
+{
+    while (count--) {
+        int c = getchar();
+        if (c != EOF) *cell = (uint8_t)c;
+    }
+}
+
 static void emit_modrm_rdi(Nob_String_Builder *sb, uint8_t reg, int32_t offset)
 {
     if (!offset) {
@@ -2335,6 +2351,20 @@ bool jit_compile(Ops ops, Code *code)
             } break;
 
             case OP_INPUT: {
+                if (op.operand > 1) {
+                    nob_da_append(&sb, 0x57); // push rdi
+                    if (base) {
+                        nob_sb_append_cstr(&sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
+                        nob_da_append_many(&sb, &base, sizeof(base));
+                    }
+                    nob_da_append(&sb, 0xbe); // mov esi, count
+                    nob_da_append_many(&sb, &op.operand, sizeof(op.operand));
+                    void (*helper)(uint8_t *, uint32_t) = fixed_head ?
+                        input_repeat : input_repeat_locked;
+                    emit_call(&sb, fnaddr(&helper, sizeof(helper)));
+                    nob_da_append(&sb, 0x5f); // pop rdi
+                    break;
+                }
                 for (size_t i = 0; i < op.operand; ++i) {
                     nob_da_append(&sb, 0x57);                // push rdi
                     int (*helper)(void) = fixed_head ? getchar_unlocked : getchar;
