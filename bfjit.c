@@ -1515,28 +1515,26 @@ static void fixed_sqrt_exec(uint8_t *cells)
     memset(cells + 20, 0, 8);
 }
 
-static void fixed_compare_exec(uint8_t *cells, uint32_t comparison)
-{
-    int32_t x, y;
-    memcpy(&x, cells + 4, sizeof(x));
-    memcpy(&y, cells + 8, sizeof(y));
-    bool value;
-    switch (comparison) {
-        case COMPARE_LT: value = x < y; break;
-        case COMPARE_LE: value = x <= y; break;
-        case COMPARE_GT: value = x > y; break;
-        case COMPARE_GE: value = x >= y; break;
-        case COMPARE_EQ: value = x == y; break;
-        default: assert(0 && "unreachable"); value = false;
+#define DEFINE_FIXED_COMPARE(name, condition) \
+    static void fixed_compare_##name(uint8_t *cells) \
+    { \
+        int32_t x, y; \
+        memcpy(&x, cells + 4, sizeof(x)); \
+        memcpy(&y, cells + 8, sizeof(y)); \
+        uint32_t biased_x = (uint32_t)x ^ UINT32_C(0x80000000); \
+        uint32_t biased_y = (uint32_t)y ^ UINT32_C(0x80000000); \
+        memset(cells, 0, 4); \
+        cells[0] = condition; \
+        memcpy(cells + 4, &biased_x, sizeof(biased_x)); \
+        memcpy(cells + 8, &biased_y, sizeof(biased_y)); \
+        memset(cells + 12, 0, 14); \
     }
-    uint32_t biased_x = (uint32_t)x ^ UINT32_C(0x80000000);
-    uint32_t biased_y = (uint32_t)y ^ UINT32_C(0x80000000);
-    memset(cells, 0, 4);
-    cells[0] = value;
-    memcpy(cells + 4, &biased_x, sizeof(biased_x));
-    memcpy(cells + 8, &biased_y, sizeof(biased_y));
-    memset(cells + 12, 0, 14);
-}
+DEFINE_FIXED_COMPARE(lt, x < y)
+DEFINE_FIXED_COMPARE(le, x <= y)
+DEFINE_FIXED_COMPARE(gt, x > y)
+DEFINE_FIXED_COMPARE(ge, x >= y)
+DEFINE_FIXED_COMPARE(eq, x == y)
+#undef DEFINE_FIXED_COMPARE
 
 static void fixed_integer_exec(uint8_t *cells)
 {
@@ -2127,10 +2125,12 @@ static void emit_fixed_compare_call(Nob_String_Builder *sb,
         nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
         nob_da_append_many(sb, &destination, sizeof(destination));
     }
-    nob_da_append(sb, 0xbe); // mov esi, comparison
-    uint32_t comparison = compare.comparison;
-    nob_da_append_many(sb, &comparison, sizeof(comparison));
-    void (*helper)(uint8_t *, uint32_t) = fixed_compare_exec;
+    static void (*const helpers[])(uint8_t *) = {
+        fixed_compare_lt, fixed_compare_le, fixed_compare_gt,
+        fixed_compare_ge, fixed_compare_eq,
+    };
+    assert(compare.comparison < NOB_ARRAY_LEN(helpers));
+    void (*helper)(uint8_t *) = helpers[compare.comparison];
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
     nob_da_append(sb, 0x5f); // pop rdi
 }
