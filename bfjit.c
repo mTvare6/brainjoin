@@ -1937,6 +1937,54 @@ static void emit_affine_term(Nob_String_Builder *sb, uint8_t factor,
     }
 }
 
+static void emit_affine_4_once(Nob_String_Builder *sb, const Affine *affine)
+{
+    enum { count = 4, width = 5, cells = width * width };
+    const uint8_t *matrix = affine->plan->tables + cells;
+    bool used[count];
+    memset(used, 0, sizeof(used));
+    for (size_t row = 0; row < count; ++row)
+        for (size_t column = 0; column < count; ++column)
+            used[column] |= matrix[row * width + column] != 0;
+
+    for (size_t column = 0; column < count; ++column) {
+        if (!used[column]) continue;
+        if (column >= 2) nob_da_append(sb, 0x44); // REX.R for r8d/r9d
+        nob_da_append_many(sb, "\x0f\xb6", 2); // movzx source, byte [cell]
+        emit_modrm_rdi(sb, (uint8_t)(column & 1), affine->offsets[column]);
+    }
+    static const uint8_t add[][3] = {
+        {0x01, 0xc2}, {0x01, 0xca}, {0x44, 0x01, 0xc2}, {0x44, 0x01, 0xca},
+    };
+    static const uint8_t sub[][3] = {
+        {0x29, 0xc2}, {0x29, 0xca}, {0x44, 0x29, 0xc2}, {0x44, 0x29, 0xca},
+    };
+    static const uint8_t lengths[] = {2, 2, 3, 3};
+    static const uint8_t multiply[][3] = {
+        {0x69, 0xf0}, {0x69, 0xf1}, {0x41, 0x69, 0xf0}, {0x41, 0x69, 0xf1},
+    };
+    for (size_t row = 0; row < count; ++row) {
+        nob_da_append(sb, 0xba); // mov edx, constant
+        uint32_t constant = matrix[row * width + count];
+        nob_da_append_many(sb, &constant, sizeof(constant));
+        for (size_t column = 0; column < count; ++column) {
+            uint8_t factor = matrix[row * width + column];
+            if (!factor) continue;
+            if (factor == 1)
+                nob_da_append_many(sb, add[column], lengths[column]);
+            else if (factor == 255)
+                nob_da_append_many(sb, sub[column], lengths[column]);
+            else {
+                nob_da_append_many(sb, multiply[column], lengths[column]);
+                uint32_t multiplier = factor;
+                nob_da_append_many(sb, &multiplier, sizeof(multiplier));
+                nob_da_append_many(sb, "\x01\xf2", 2); // add edx, esi
+            }
+        }
+        emit_store_byte(sb, 2, affine->offsets[row]);
+    }
+}
+
 static bool emit_small_affine_if(Nob_String_Builder *sb, const Affine *affine,
                                  int32_t base)
 {
@@ -2144,6 +2192,20 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
     size_t done_patch = sb->count;
     uint32_t zero = 0;
     nob_da_append_many(sb, &zero, sizeof(zero));
+    size_t once_done_patch = 0;
+    if (affine->count == 4 && affine->kind == AFFINE_DOWN) {
+        nob_da_append(sb, 0x80); // cmp byte [control], 1
+        emit_modrm_rdi(sb, 7, affine->offsets[affine->control]);
+        nob_sb_append_cstr(sb, "\x01\x0f\x85"); // jne fallback
+        size_t fallback_patch = sb->count;
+        nob_da_append_many(sb, &zero, sizeof(zero));
+        emit_affine_4_once(sb, affine);
+        nob_da_append(sb, 0xe9); // jmp done
+        once_done_patch = sb->count;
+        nob_da_append_many(sb, &zero, sizeof(zero));
+        int32_t relative = (int32_t)(sb->count - (fallback_patch + 4));
+        memcpy(sb->items + fallback_patch, &relative, sizeof(relative));
+    }
     nob_sb_append_cstr(sb, "\x48\xbe"); // movabs rsi, affine
     uintptr_t descriptor = (uintptr_t)affine;
     nob_da_append_many(sb, &descriptor, sizeof(descriptor));
@@ -2161,6 +2223,10 @@ static void emit_affine_call(Nob_String_Builder *sb, const Affine *affine,
         default: helper = affine_exec; break;
     }
     emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    if (once_done_patch) {
+        int32_t relative = (int32_t)(sb->count - (once_done_patch + 4));
+        memcpy(sb->items + once_done_patch, &relative, sizeof(relative));
+    }
     int32_t relative = (int32_t)(sb->count - (done_patch + 4));
     memcpy(sb->items + done_patch, &relative, sizeof(relative));
     nob_da_append(sb, 0x5f); // pop rdi
