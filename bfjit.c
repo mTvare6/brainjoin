@@ -271,10 +271,17 @@ typedef struct {
 
 enum { AFFINE_DOWN = 1, AFFINE_UP, AFFINE_IF };
 
+typedef struct {
+    atomic_bool built[256];
+    uint32_t constants[256];
+    uint32_t entries[256][4][256];
+} Affine4_Cache;
+
 typedef struct Affine_Plan {
     struct Affine_Plan *next;
     uint32_t count, kind;
     atomic_bool built;
+    _Atomic(Affine4_Cache *) cache4;
     uint8_t tables[];
 } Affine_Plan;
 
@@ -1171,6 +1178,7 @@ static Affine_Plan *intern_affine(Affine_Plan **plans, uint32_t count,
     plan->next = *plans;
     plan->count = count;
     plan->kind = kind;
+    atomic_init(&plan->cache4, NULL);
     memset(plan->tables + table_count * cells, 0, 16);
     if (kind == AFFINE_IF) {
         memcpy(plan->tables, matrix, cells);
@@ -1405,26 +1413,69 @@ DEFINE_AFFINE_EXEC(28)
 DEFINE_AFFINE_EXEC(29)
 #undef DEFINE_AFFINE_EXEC
 
+static Affine4_Cache *build_affine4_cache(Affine_Plan *plan,
+                                           uint8_t iterations)
+{
+    Affine4_Cache *cache = atomic_load_explicit(&plan->cache4,
+                                                 memory_order_acquire);
+    if (cache && atomic_load_explicit(&cache->built[iterations],
+                                      memory_order_acquire)) return cache;
+    if (pthread_mutex_lock(&affine_plan_mutex) != 0) abort();
+    cache = atomic_load_explicit(&plan->cache4, memory_order_relaxed);
+    if (!cache) {
+        cache = calloc(1, sizeof(*cache));
+        if (!cache) abort();
+        for (size_t i = 0; i < NOB_ARRAY_LEN(cache->built); ++i)
+            atomic_init(&cache->built[i], false);
+        atomic_store_explicit(&plan->cache4, cache, memory_order_release);
+    }
+    if (!atomic_load_explicit(&cache->built[iterations],
+                              memory_order_relaxed)) {
+        enum { count = 4, width = 5, cells = width * width };
+        const uint8_t *matrix = plan->tables + (size_t)iterations * cells;
+        uint32_t constant = 0;
+        for (size_t row = 0; row < count; ++row)
+            constant |= (uint32_t)matrix[row * width + count] << (row * 8);
+        cache->constants[iterations] = constant;
+        for (size_t column = 0; column < count; ++column) {
+            for (size_t value = 0; value < 256; ++value) {
+                uint32_t packed = 0;
+                for (size_t row = 0; row < count; ++row) {
+                    uint8_t product =
+                        (uint8_t)(matrix[row * width + column] * value);
+                    packed |= (uint32_t)product << (row * 8);
+                }
+                cache->entries[iterations][column][value] = packed;
+            }
+        }
+        atomic_store_explicit(&cache->built[iterations], true,
+                              memory_order_release);
+    }
+    if (pthread_mutex_unlock(&affine_plan_mutex) != 0) abort();
+    return cache;
+}
+
 static void affine_exec_4_down(uint8_t *base, const Affine *affine)
 {
-    enum { count = 4, width = 5, cells = width * width };
+    enum { count = 4 };
     uint8_t iterations = base[affine->offsets[affine->control]];
-    uint8_t state[width], next[count];
+    uint8_t state[count];
     for (size_t i = 0; i < count; ++i)
         state[i] = base[affine->offsets[i]];
-    state[count] = 1;
     if (iterations != 1 &&
         !atomic_load_explicit(&affine->plan->built, memory_order_acquire))
         build_affine_plan((Affine_Plan *)affine->plan);
-    const uint8_t *matrix = affine->plan->tables + (size_t)iterations * cells;
-    for (size_t row = 0; row < count; ++row) {
-        uint32_t sum = 0;
-        for (size_t column = 0; column < width; ++column)
-            sum += (uint32_t)matrix[row * width + column] * state[column];
-        next[row] = (uint8_t)sum;
+    Affine4_Cache *cache = build_affine4_cache(
+        (Affine_Plan *)affine->plan, iterations);
+    __m128i sum = _mm_cvtsi32_si128((int)cache->constants[iterations]);
+    for (size_t column = 0; column < count; ++column) {
+        __m128i contribution = _mm_cvtsi32_si128(
+            (int)cache->entries[iterations][column][state[column]]);
+        sum = _mm_add_epi8(sum, contribution);
     }
+    uint32_t next = (uint32_t)_mm_cvtsi128_si32(sum);
     for (size_t i = 0; i < count; ++i)
-        base[affine->offsets[i]] = next[i];
+        base[affine->offsets[i]] = (uint8_t)(next >> (i * 8));
 }
 
 static void affine_exec_14(uint8_t *base, const Affine *affine)
