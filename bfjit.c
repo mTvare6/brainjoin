@@ -2630,16 +2630,14 @@ bool jit_compile(Ops ops, Code *code)
             0xf7,0xd9,                               // neg ecx
             0x41,0x0f,0x48,0xc9,                     // cmovs ecx, r9d
             0x89,0x56,0x04,                          // mov [rsi+4], edx
-            0x41,0x89,0xd2,                          // mov r10d, edx
             0x89,0x4e,0x08,                          // mov [rsi+8], ecx
-            0x4c,0x0f,0xaf,0xd1,                     // imul r10, rcx
-            0x4c,0x89,0x56,0x0c,                     // mov [rsi+12], r10
-            0x49,0xc1,0xea,0x10,                     // shr r10, 16
-            0x45,0x89,0xd0,                          // mov r8d, r10d
-            0x45,0x89,0xc3,                          // mov r11d, r8d
-            0x41,0xf7,0xdb,                          // neg r11d
+            0x48,0x0f,0xaf,0xd1,                     // imul rdx, rcx
+            0x48,0x89,0x56,0x0c,                     // mov [rsi+12], rdx
+            0x48,0xc1,0xea,0x10,                     // shr rdx, 16
+            0x41,0x89,0xd0,                          // mov r8d, edx
+            0xf7,0xda,                               // neg edx
             0x44,0x31,0xc8,                          // xor eax, r9d
-            0x45,0x0f,0x48,0xc3,                     // cmovs r8d, r11d
+            0x44,0x0f,0x48,0xc2,                     // cmovs r8d, edx
             0x44,0x89,0x06,                          // mov [rsi], r8d
             0xc3,                                    // ret
         };
