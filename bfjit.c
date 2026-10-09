@@ -1515,27 +1515,6 @@ static void fixed_sqrt_exec(uint8_t *cells)
     memset(cells + 20, 0, 8);
 }
 
-#define DEFINE_FIXED_COMPARE(name, condition) \
-    static void fixed_compare_##name(uint8_t *cells) \
-    { \
-        int32_t x, y; \
-        memcpy(&x, cells + 4, sizeof(x)); \
-        memcpy(&y, cells + 8, sizeof(y)); \
-        uint32_t biased_x = (uint32_t)x ^ UINT32_C(0x80000000); \
-        uint32_t biased_y = (uint32_t)y ^ UINT32_C(0x80000000); \
-        memset(cells, 0, 4); \
-        cells[0] = condition; \
-        memcpy(cells + 4, &biased_x, sizeof(biased_x)); \
-        memcpy(cells + 8, &biased_y, sizeof(biased_y)); \
-        memset(cells + 12, 0, 14); \
-    }
-DEFINE_FIXED_COMPARE(lt, x < y)
-DEFINE_FIXED_COMPARE(le, x <= y)
-DEFINE_FIXED_COMPARE(gt, x > y)
-DEFINE_FIXED_COMPARE(ge, x >= y)
-DEFINE_FIXED_COMPARE(eq, x == y)
-#undef DEFINE_FIXED_COMPARE
-
 static void fixed_integer_exec(uint8_t *cells)
 {
     int32_t input;
@@ -2117,22 +2096,19 @@ static void emit_fixed_sqrt_call(Nob_String_Builder *sb, int32_t base)
 }
 
 static void emit_fixed_compare_call(Nob_String_Builder *sb,
-                                    Fixed_Compare compare, int32_t base)
+                                    Fixed_Compare compare, int32_t base,
+                                    Addrs compare_calls[])
 {
-    nob_da_append(sb, 0x57); // push rdi
     int32_t destination = base + compare.destination;
     if (destination) {
-        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+destination]
+        nob_sb_append_cstr(sb, "\x48\x8d\xb7"); // lea rsi, [rdi+destination]
         nob_da_append_many(sb, &destination, sizeof(destination));
-    }
-    static void (*const helpers[])(uint8_t *) = {
-        fixed_compare_lt, fixed_compare_le, fixed_compare_gt,
-        fixed_compare_ge, fixed_compare_eq,
-    };
-    assert(compare.comparison < NOB_ARRAY_LEN(helpers));
-    void (*helper)(uint8_t *) = helpers[compare.comparison];
-    emit_call(sb, fnaddr(&helper, sizeof(helper)));
-    nob_da_append(sb, 0x5f); // pop rdi
+    } else nob_sb_append_cstr(sb, "\x48\x89\xfe"); // mov rsi, rdi
+    assert(compare.comparison < 5);
+    nob_da_append(sb, 0xe8); // call comparison stub
+    nob_da_append(&compare_calls[compare.comparison], sb->count);
+    uint32_t zero = 0;
+    nob_da_append_many(sb, &zero, sizeof(zero));
 }
 
 static void emit_fixed_add_call(Nob_String_Builder *sb, Fixed_Add add,
@@ -2239,6 +2215,7 @@ bool jit_compile(Ops ops, Code *code)
     Loop_Patches loops = {0};
     Addrs divide_calls = {0};
     Addrs multiply_calls = {0};
+    Addrs compare_calls[5] = {0};
     bool fixed_head = ops.static_positions;
     int64_t static_head = 0;
     Affine_Plan *plans = NULL;
@@ -2290,7 +2267,7 @@ bool jit_compile(Ops ops, Code *code)
             }
             Fixed_Compare compare;
             if (fixed_compare_block(ops, i, &end, &compare)) {
-                emit_fixed_compare_call(&sb, compare, base);
+                emit_fixed_compare_call(&sb, compare, base, compare_calls);
                 static_head += compare.final_head;
                 i = end;
                 continue;
@@ -2649,6 +2626,36 @@ bool jit_compile(Ops ops, Code *code)
         }
     }
 
+    static const uint8_t compare_conditions[] = {0x9c, 0x9e, 0x9f, 0x9d, 0x94};
+    for (size_t comparison = 0;
+         comparison < NOB_ARRAY_LEN(compare_calls); ++comparison) {
+        if (!compare_calls[comparison].count) continue;
+        size_t compare_stub = sb.count;
+        static const uint8_t before_condition[] = {
+            0x31,0xc0,                               // xor eax, eax
+            0x48,0x89,0x46,0x0c,                    // mov [rsi+12], rax
+            0x48,0x89,0x46,0x12,                    // mov [rsi+18], rax
+            0x89,0x06,                               // mov [rsi], eax
+            0x8b,0x4e,0x08,                          // mov ecx, [rsi+8]
+            0x39,0x4e,0x04,                          // cmp [rsi+4], ecx
+            0x48,0xb8,0,0,0,0x80,0,0,0,0x80,        // movabs rax, sign bits
+            0x0f,
+        };
+        static const uint8_t after_condition[] = {
+            0x06,                                    // setcc byte [rsi]
+            0x48,0x31,0x46,0x04,                    // xor [rsi+4], rax
+            0xc3,                                    // ret
+        };
+        nob_da_append_many(&sb, before_condition, sizeof(before_condition));
+        nob_da_append(&sb, compare_conditions[comparison]);
+        nob_da_append_many(&sb, after_condition, sizeof(after_condition));
+        for (size_t i = 0; i < compare_calls[comparison].count; ++i) {
+            size_t operand = compare_calls[comparison].items[i];
+            int32_t relative = (int32_t)(compare_stub - (operand + 4));
+            memcpy(sb.items + operand, &relative, sizeof(relative));
+        }
+    }
+
     code->len = sb.count;
     code->run = mmap(NULL, sb.count, PROT_EXEC | PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code->run == MAP_FAILED) {
@@ -2668,6 +2675,8 @@ defer:
     nob_da_free(loops);
     nob_da_free(divide_calls);
     nob_da_free(multiply_calls);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(compare_calls); ++i)
+        nob_da_free(compare_calls[i]);
     return result;
 }
 
