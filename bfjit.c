@@ -967,16 +967,20 @@ static bool fixed_compare_block(Ops ops, size_t at, size_t *end,
         uint8_t comparison;
     } candidates[] = {
         {774, UINT64_C(0xfd0b0134c1cff96f), UINT64_C(0x595ec99943a8056b), COMPARE_LT},
-        {777, UINT64_C(0x7c76e6f00f7bc8ed), UINT64_C(0xb9fa5349e6bd55d9), COMPARE_LE},
         {774, UINT64_C(0xa9393b8256ba2078), UINT64_C(0xdf078368dd822a13), COMPARE_GT},
+        {777, UINT64_C(0x7c76e6f00f7bc8ed), UINT64_C(0xb9fa5349e6bd55d9), COMPARE_LE},
         {777, UINT64_C(0x67e3fb0543a2a28b), UINT64_C(0xd65bc77d71ba1078), COMPARE_GE},
         {757, UINT64_C(0xe5ea00fa292b51aa), UINT64_C(0x47be759d671976f8), COMPARE_EQ},
     };
+    size_t previous_count = SIZE_MAX;
+    uint64_t first = 0, second = 0;
     for (size_t candidate = 0; candidate < NOB_ARRAY_LEN(candidates); ++candidate) {
         size_t count = candidates[candidate].count;
         if (at + count > ops.count) continue;
-        uint64_t first, second;
-        normalized_fingerprint(ops, at, count, &first, &second);
+        if (count != previous_count) {
+            normalized_fingerprint(ops, at, count, &first, &second);
+            previous_count = count;
+        }
         if (first != candidates[candidate].first ||
             second != candidates[candidate].second) continue;
         *result = (Fixed_Compare){-24, -10,
