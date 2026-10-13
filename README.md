@@ -29,7 +29,7 @@ Measured using N=12 for others and N=7 for [reduced rayfuck](https://github.com/
 | [hanoi](https://github.com/sreekotay/bffsree/blob/fbe53a84327d63cee861c621d24e9dbe9ad097e6/BFBench-1.4/hanoi.b) | **3.456 ms** | 1,025.9 ms (296.87×) | 13.225 ms (3.83×) | 10.362 ms (3.00×) | 6.736 ms (1.95×) |
 | [golden ratio](https://github.com/sreekotay/bffsree/blob/fbe53a84327d63cee861c621d24e9dbe9ad097e6/BFBench-1.4/golden.b) | 6.367 ms | 11.101 ms (1.74×) | 8.902 ms (1.40×) | **6.290 ms (0.99×)** | 8.235 ms (1.29×) |
 | [long loops](https://github.com/sreekotay/bffsree/blob/fbe53a84327d63cee861c621d24e9dbe9ad097e6/BFBench-1.4/long.b) | **5.231 ms** | 2,135.0 ms (408.18×) | 7.060 ms (1.35×) | 5.292 ms (1.01×) | 38.201 ms (7.30×) |
-| [reduced rayfuck](https://github.com/danthedaniel/BF-JIT/blob/b366a64a9d83cbed1b985560be35e03c410f1eb9/tests/programs/ray-small.bf) | **403.7 ms** | >120 s (>297×) | 2,237.2 ms (5.54×) | >120 s (>297×) | >120 s (>297×) |
+| [reduced rayfuck](https://github.com/danthedaniel/BF-JIT/blob/b366a64a9d83cbed1b985560be35e03c410f1eb9/tests/programs/ray-small.bf) | **403.7 ms** | >100 d (>216,000x) | 2,237.2 ms (5.54×) | >600 s (>1,486×) | >600 s (>1,486×) |
 
 ### Instructions
 
