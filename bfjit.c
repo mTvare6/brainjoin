@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <immintrin.h>
 
@@ -28,6 +29,8 @@ typedef enum {
     OP_CHILD_END       = ')',
     OP_JOIN            = '#',
 } Op_Kind;
+
+#define ORDERED_FORK (UINT32_C(1) << 31)
 
 typedef struct {
     Op_Kind kind;
@@ -72,6 +75,7 @@ typedef struct {
 
 typedef struct {
     uint32_t site;
+    size_t op_index;
     bool closed;
 } Fork;
 
@@ -86,8 +90,17 @@ typedef void (*Jit_Fn)(void *);
 typedef struct Child Child;
 typedef struct Join Join;
 typedef struct {
+    Nob_String_Builder *items;
+    size_t count;
+    size_t capacity;
+} Output_Buffers;
+
+typedef struct {
     uint32_t stop_at;
     Join *joins;
+    Nob_String_Builder output;
+    Output_Buffers joined_outputs;
+    uint32_t ordered_depth;
 } Thread;
 
 struct Child {
@@ -101,6 +114,8 @@ struct Join {
     pthread_t thread;
     pthread_barrier_t start;
     uint32_t site;
+    bool ordered;
+    bool buffered;
     Child *child;
     Join *next;
 };
@@ -119,7 +134,7 @@ static void *child_main(void *arg)
     return NULL;
 }
 
-static void fork_thread(uint8_t *head, Jit_Fn run, uint32_t site)
+static void fork_thread(uint8_t *head, Jit_Fn run, uint32_t site, bool ordered)
 {
     Child *child = calloc(1, sizeof(*child));
     Join *join = calloc(1, sizeof(*join));
@@ -127,8 +142,12 @@ static void fork_thread(uint8_t *head, Jit_Fn run, uint32_t site)
     child->run = run;
     child->head = head;
     child->thread.stop_at = site;
+    if (ordered) thread->ordered_depth += 1;
+    child->thread.ordered_depth = thread->ordered_depth;
     child->join = join;
     join->site = site;
+    join->ordered = ordered;
+    join->buffered = thread->ordered_depth > 0;
     join->child = child;
     join->next = thread->joins;
     thread->joins = join;
@@ -142,15 +161,67 @@ static int child_ends_here(uint32_t site)
     return thread->stop_at == site;
 }
 
+static void flush_ordered_output(Thread *owner)
+{
+    size_t buffer_count = owner->joined_outputs.count + 1;
+    size_t *positions = calloc(buffer_count, sizeof(*positions));
+    if (!positions) abort();
+    bool more;
+    do {
+        more = false;
+        for (size_t i = 0; i < buffer_count; ++i) {
+            Nob_String_Builder *buffer = i == 0
+                ? &owner->output : &owner->joined_outputs.items[i - 1];
+            size_t at = positions[i];
+            if (at == buffer->count) continue;
+            more = true;
+            char *newline = memchr(buffer->items + at, '\n', buffer->count - at);
+            size_t end = newline ? (size_t)(newline - buffer->items) + 1
+                                 : buffer->count;
+            fwrite(buffer->items + at, end - at, 1, stdout);
+            positions[i] = end;
+        }
+    } while (more);
+    free(positions);
+    nob_da_free(owner->output);
+    for (size_t i = 0; i < owner->joined_outputs.count; ++i)
+        nob_da_free(owner->joined_outputs.items[i]);
+    nob_da_free(owner->joined_outputs);
+}
+
 static void join_thread(uint32_t site)
 {
     Join *join = thread->joins;
     if (!join || join->site != site) abort();
     if (pthread_join(join->thread, NULL) != 0) abort();
+    if (join->buffered) {
+        nob_da_append(&thread->joined_outputs, join->child->thread.output);
+        memset(&join->child->thread.output, 0,
+               sizeof(join->child->thread.output));
+        nob_da_append_many(&thread->joined_outputs,
+                           join->child->thread.joined_outputs.items,
+                           join->child->thread.joined_outputs.count);
+        nob_da_free(join->child->thread.joined_outputs);
+    }
+    nob_da_free(join->child->thread.output);
+    if (join->ordered) {
+        assert(thread->ordered_depth > 0);
+        thread->ordered_depth -= 1;
+        if (thread->ordered_depth == 0) flush_ordered_output(thread);
+    }
     pthread_barrier_destroy(&join->start);
     thread->joins = join->next;
     free(join->child);
     free(join);
+}
+
+static int thread_putchar(int value)
+{
+    if (thread->ordered_depth) {
+        nob_da_append(&thread->output, (char)value);
+        return (unsigned char)value;
+    }
+    return putchar(value);
 }
 
 bool interpret(Ops ops)
@@ -2123,6 +2194,25 @@ static void emit_call(Nob_String_Builder *sb, uintptr_t address)
     nob_sb_append_cstr(sb, "\xff\xd0");
 }
 
+static void wait_zero(uint8_t *cell)
+{
+    while (__atomic_load_n(cell, __ATOMIC_ACQUIRE)) {
+        sched_yield();
+    }
+}
+
+static void emit_wait_zero(Nob_String_Builder *sb, int32_t base)
+{
+    nob_da_append(sb, 0x57); // save head
+    if (base) {
+        nob_sb_append_cstr(sb, "\x48\x8d\xbf"); // lea rdi, [rdi+base]
+        nob_da_append_many(sb, &base, sizeof(base));
+    }
+    void (*helper)(uint8_t *) = wait_zero;
+    emit_call(sb, fnaddr(&helper, sizeof(helper)));
+    nob_da_append(sb, 0x5f); // restore head
+}
+
 static void emit_fixed_multiply_call(Nob_String_Builder *sb, int32_t base,
                                      Addrs *calls)
 {
@@ -2298,6 +2388,14 @@ bool jit_compile(Ops ops, Code *code)
                 i = close;
                 continue;
             }
+        }
+        if (op.kind == OP_JUMP_IF_ZERO && i + 1 < ops.count &&
+            op.operand == i + 2 &&
+            ops.items[i + 1].kind == OP_JUMP_IF_NONZERO &&
+            ops.items[i + 1].operand == i + 1) {
+            emit_wait_zero(&sb, (int32_t)static_head);
+            i += 1;
+            continue;
         }
         {
             size_t end;
@@ -2498,7 +2596,7 @@ bool jit_compile(Ops ops, Code *code)
                     nob_da_append(&sb, 0x57);                    // push rdi
                     nob_da_append_many(&sb, "\x0f\xb6", 2);     // movzx edi, byte [cell]
                     emit_modrm_rdi(&sb, 7, base);
-                    int (*helper)(int) = fixed_head ? putchar_unlocked : putchar;
+                    int (*helper)(int) = fixed_head ? putchar_unlocked : thread_putchar;
                     emit_call(&sb, fnaddr(&helper, sizeof(helper)));
                     nob_da_append(&sb, 0x5f);                    // pop rdi
                 }
@@ -2584,9 +2682,12 @@ bool jit_compile(Ops ops, Code *code)
                 nob_da_append_many(&sb, &zero, sizeof(zero));
                 size_t source = sb.count;
                 nob_sb_append_cstr(&sb, "\xba");                    // site
-                uint32_t site = op.operand;
+                uint32_t site = op.operand & ~ORDERED_FORK;
                 nob_da_append_many(&sb, &site, sizeof(site));
-                void (*helper)(uint8_t *, Jit_Fn, uint32_t) = fork_thread;
+                nob_sb_append_cstr(&sb, "\xb9");                    // ordered
+                uint32_t ordered = !!(op.operand & ORDERED_FORK);
+                nob_da_append_many(&sb, &ordered, sizeof(ordered));
+                void (*helper)(uint8_t *, Jit_Fn, uint32_t, bool) = fork_thread;
                 emit_call(&sb, fnaddr(&helper, sizeof(helper)));
                 nob_sb_append_cstr(&sb, "\x5f");                    // restore parent head
                 int32_t relative = (int32_t)(sb.count - source);
@@ -2866,7 +2967,10 @@ run_done:
                 uint32_t site = next_site++;
                 ops->static_positions = false;
                 nob_da_append(ops, ((Op){.kind = OP_FORK, .operand = site}));
-                nob_da_append(&forks, ((Fork){.site = site}));
+                nob_da_append(&forks, ((Fork){
+                    .site = site,
+                    .op_index = ops->count - 1,
+                }));
                 c = lexer_next(&l);
             } break;
 
@@ -2891,6 +2995,7 @@ run_done:
                     printf("%s [%zu]: ERROR: Join before child end\n", file_path, l.pos);
                     nob_return_defer(false);
                 }
+                ops->items[fork.op_index].operand |= ORDERED_FORK;
                 forks.count -= 1;
                 nob_da_append(ops, ((Op){.kind = OP_JOIN, .operand = fork.site}));
                 c = lexer_next(&l);
