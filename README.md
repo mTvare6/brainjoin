@@ -19,7 +19,7 @@ $ ./brainjoin ./examples/fork-join.bf
 The measurements were done on Intel Core Ultra 9 185H with the same core.
 Scores listed are relative to brainjoin.
 
-Measured using N=12 for mandelbrot, N=60 for the BFBench programs, N=7 for [reduced rayfuck](https://github.com/danthedaniel/BF-JIT/blob/b366a64a9d83cbed1b985560be35e03c410f1eb9/tests/programs/ray-small.bf), and N=3 for [rayfuck](https://github.com/mTvare6/rayfuck/blob/22630908281be886916b6b7c6e3468f7616ff7f5/ray.bf).
+Measured using N=12 for mandelbrot, N=60 for the BFBench programs, N=7 for [reduced rayfuck](https://github.com/danthedaniel/BF-JIT/blob/b366a64a9d83cbed1b985560be35e03c410f1eb9/tests/programs/ray-small.bf), and N=3 for [rayfuck](https://github.com/mTvare6/rayfuck/blob/22630908281be886916b6b7c6e3468f7616ff7f5/ray.bf) and [rayjoin](https://github.com/mTvare6/rayfuck/blob/master/rayjoin.bf).
 
 ### Time
 
@@ -31,6 +31,7 @@ Measured using N=12 for mandelbrot, N=60 for the BFBench programs, N=7 for [redu
 | [long loops](https://github.com/sreekotay/bffsree/blob/fbe53a84327d63cee861c621d24e9dbe9ad097e6/BFBench-1.4/long.b) | **5.231 ms** | 2,135.0 ms (408.18×) | 7.060 ms (1.35×) | 5.292 ms (1.01×) | 38.201 ms (7.30×) |
 | [reduced rayfuck](https://github.com/danthedaniel/BF-JIT/blob/b366a64a9d83cbed1b985560be35e03c410f1eb9/tests/programs/ray-small.bf) | **403.7 ms** | >600 s (>1,486×) | 2,237.2 ms (5.54×) | >600 s (>1,486×) | >600 s (>1,486×) |
 | [rayfuck](https://github.com/mTvare6/rayfuck/blob/22630908281be886916b6b7c6e3468f7616ff7f5/ray.bf) | **40.31 s** | >100 d (>216,000×) | 80.06 s (1.99×) | >600 s (>14.88×) | >600 s (>14.88×) |
+| [rayjoin](https://github.com/mTvare6/rayfuck/blob/master/rayjoin.bf) | **4.52s** | | | | |
 
 ### Instructions
 
@@ -41,3 +42,5 @@ Measured using N=12 for mandelbrot, N=60 for the BFBench programs, N=7 for [redu
 | golden ratio | **63.01M** | 97.61M (1.55×) | 94.66M (1.50×) | 71.73M (1.14×) | 87.79M (1.39×) |
 | long loops | **68.17M** | 9.871B (144.81×) | 103.73M (1.52×) | 107.41M (1.58×) | 668.43M (9.81×) |
 | reduced rayfuck | **3.017B** | >1.450T (>480.5×) | 25.120B (8.33×) | >411.766B (>136.5×) | >1.831T (>606.9×) |
+| rayfuck | **285.600B** | >1.366T (>4.78×) | 1.033T (3.62×) | >413.639B (>1.45×) | >1.698T (>5.95×) |
+| rayjoin | **297.750B** | | | | |
